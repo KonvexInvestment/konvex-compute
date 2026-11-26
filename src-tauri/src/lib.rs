@@ -34,11 +34,12 @@ fn is_older_than(ts: Option<&str>, max_age: chrono::Duration) -> bool {
     }
 }
 
-/// Totalausfall eines Backfills (z. B. offline nach dem Aufwachen): Dann darf
+/// Gescheiterter Backfill: kein einziger Tag rekonstruiert und Abruffehler vorhanden
+/// (offline nach dem Aufwachen, Abbruch nach wenigen Strikes, Rate-Limit). Dann darf
 /// last_backfill_at nicht fortgeschrieben werden, sonst sperrt die 20-Stunden-Regel
 /// den nächsten automatischen Versuch, obwohl nichts geladen wurde.
-fn backfill_failed_completely(strikes_fetched: usize, errors: &[String]) -> bool {
-    strikes_fetched == 0 && !errors.is_empty()
+fn backfill_failed_completely(days_reconstructed: usize, errors: &[String]) -> bool {
+    days_reconstructed == 0 && !errors.is_empty()
 }
 
 fn unix_to_rfc3339(ts: i64) -> Option<String> {
@@ -173,9 +174,9 @@ impl AppState {
             let clamped_days = days.clamp(3, 30);
             let (days_out, strikes_fetched, errors) =
                 reconstruct_daily_backfill(&self.client, &cur.gpus, clamped_days).await;
-            if backfill_failed_completely(strikes_fetched, &errors) {
+            if backfill_failed_completely(days_out.len(), &errors) {
                 return Err(format!(
-                    "Kein Kursverlauf abrufbar, Backfill wird beim nächsten Start erneut versucht. {}",
+                    "Kein Tag rekonstruierbar ({strikes_fetched} Kursverläufe geladen), Backfill wird beim nächsten Start erneut versucht. {}",
                     errors.first().map(String::as_str).unwrap_or("")
                 ));
             }
@@ -430,9 +431,10 @@ mod tests {
     #[test]
     fn total_backfill_outage_is_not_recorded_as_done() {
         let err = vec!["Netzwerkfehler bei https://clob.polymarket.com/prices-history".to_string()];
-        // Offline: nichts geladen, Fehler vorhanden -> Fehler, Zeitstempel bleibt
+        // Offline oder Abbruch nach wenigen Strikes: kein Tag rekonstruiert, Fehler vorhanden
+        // -> Fehler, Zeitstempel bleibt
         assert!(backfill_failed_completely(0, &err));
-        // Teilausfall: Rest wird gespeichert
+        // Teilausfall mit rekonstruierten Tagen: Rest wird gespeichert
         assert!(!backfill_failed_completely(12, &err));
         // Junger Markt ohne Vortage bzw. ohne Token: kein Fehler, gilt als erledigt
         assert!(!backfill_failed_completely(0, &[]));
