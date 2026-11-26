@@ -251,7 +251,7 @@ fn fmt_pct_label(alpha: f64) -> String {
 
 /// Symmetrisch getrimmter Kern-Erwartungswert strikt auf Basis beobachteter Strikes.
 ///
-/// Wählt eff_alpha = max(base_alpha, s_min_obs, 1 - s_max_obs) (sofern <= 0.35),
+/// Wählt eff_alpha = max(base_alpha, s_min_obs, 1 - s_max_obs) (ab 0.40 Rückfall auf den Median),
 /// damit beide Quantilgrenzen exakt auf der gemeinsamen Überlebensfunktion liegen
 /// und liefert das effektive Band-Label transparent mit zurück.
 pub fn compute_expected_value_trimmed(

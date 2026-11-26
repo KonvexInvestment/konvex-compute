@@ -9,6 +9,7 @@ import {
   renderForwardChart,
   renderStrikeHistoryChart,
 } from "./charts.js";
+import { annotateTerms, friendlyError, installTermTooltips } from "./glossary.js";
 
 function tauriInvoke(cmd, args = {}) {
   const core = window.__TAURI__ && window.__TAURI__.core;
@@ -41,7 +42,57 @@ const state = {
   strikeReqSeq: 0,
   compareReqSeq: 0,
   toastTimer: null,
+  // Lokal angestoßene Aktionen (bis das Backend-Busy-Event eintrifft)
+  pending: { refresh: false, backfill: false },
+  // Fehler aus einer Nutzeraktion: { title, raws }
+  actionError: null,
+  // Signatur der zuletzt weggeklickten Abruf-Hinweise
+  dismissedFetchSig: "",
+  // Signatur des aktuell angezeigten Banners
+  bannerSig: "",
 };
+
+const VIEWS = ["curve", "compare", "matrix", "store"];
+const GPU_KEYS = ["H100", "H200", "B200", "B300"];
+const HIST_WINDOWS = ["30", "90", "all"];
+const SETTINGS_KEY = "konvex-compute-ui";
+
+function loadSettings() {
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") || {};
+  } catch {
+    saved = {};
+  }
+  if (VIEWS.includes(saved.view)) state.activeView = saved.view;
+  if (GPU_KEYS.includes(saved.gpu)) state.selectedGpu = saved.gpu;
+  if (HIST_WINDOWS.includes(saved.historyWindow)) state.historyWindow = saved.historyWindow;
+  for (const key of ["showIqr", "showOuter", "showMeanTrimmed", "showMeanRaw"]) {
+    if (typeof saved[key] === "boolean") state[key] = saved[key];
+  }
+  if (saved.expiryByGpu && typeof saved.expiryByGpu === "object") {
+    for (const [gpu, slug] of Object.entries(saved.expiryByGpu)) {
+      if (GPU_KEYS.includes(gpu) && typeof slug === "string") state.selectedExpiryByGpu[gpu] = slug;
+    }
+  }
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+      view: state.activeView,
+      gpu: state.selectedGpu,
+      historyWindow: state.historyWindow,
+      showIqr: state.showIqr,
+      showOuter: state.showOuter,
+      showMeanTrimmed: state.showMeanTrimmed,
+      showMeanRaw: state.showMeanRaw,
+      expiryByGpu: state.selectedExpiryByGpu,
+    }));
+  } catch {
+    /* Speicher voll oder gesperrt: Einstellungen gelten dann nur für diese Sitzung */
+  }
+}
 
 const els = {
   freshnessDot: document.getElementById("freshness-dot"),
@@ -80,6 +131,9 @@ const els = {
   optOuter: document.getElementById("opt-outer"),
   optMeanTrimmed: document.getElementById("opt-mean-trimmed"),
   optMeanRaw: document.getElementById("opt-mean-raw"),
+  freshnessBadge: document.getElementById("freshness-badge"),
+  chartLegend: document.getElementById("chart-legend"),
+  matrixHeadRow: document.getElementById("matrix-head-row"),
   forwardChartStage: document.getElementById("forward-chart-stage"),
   forwardChartSvg: document.getElementById("forward-chart-svg"),
   chartTooltip: document.getElementById("chart-tooltip"),
@@ -148,9 +202,108 @@ function deltaClass(v) {
   return v >= 0 ? "is-pos" : "is-neg";
 }
 
-function showError(msg) {
-  els.errorBanner.hidden = !msg;
-  els.errorBanner.textContent = msg || "";
+function fmtAgo(iso) {
+  const ts = new Date(iso).getTime();
+  if (Number.isNaN(ts)) return "";
+  const min = Math.floor((Date.now() - ts) / 60000);
+  if (min < 1) return "gerade eben";
+  if (min < 60) return `vor ${min} Min.`;
+  const hours = Math.floor(min / 60);
+  if (hours < 24) return `vor ${hours} Std.`;
+  const days = Math.floor(hours / 24);
+  return days === 1 ? "vor 1 Tag" : `vor ${days} Tagen`;
+}
+
+function fmtUntil(iso) {
+  const ts = new Date(iso).getTime();
+  if (Number.isNaN(ts)) return "";
+  const min = Math.ceil((ts - Date.now()) / 60000);
+  return min <= 0 ? "gleich" : `in ${min} Min.`;
+}
+
+/* ---------- Hinweis-Banner (verständlich und schließbar) ---------- */
+
+function setActionError(title, raws) {
+  const list = (Array.isArray(raws) ? raws : [raws]).map((r) => String(r)).filter(Boolean);
+  state.actionError = { title, raws: list };
+  renderBanner();
+}
+
+function clearActionError() {
+  if (!state.actionError) return;
+  state.actionError = null;
+  renderBanner();
+}
+
+function renderBanner() {
+  let title = "";
+  let raws = [];
+  let tone = "error";
+  if (state.actionError) {
+    ({ title, raws } = state.actionError);
+  } else {
+    const errs = (state.data && state.data.last_errors) || [];
+    if (errs.length && errs.join("|") !== state.dismissedFetchSig) {
+      title = "Letzter Abruf unvollständig. Für diese Quellen wird der zuletzt gespeicherte Stand angezeigt:";
+      raws = errs;
+      tone = "warn";
+    }
+  }
+  if (!title) {
+    state.bannerSig = "";
+    els.errorBanner.hidden = true;
+    els.errorBanner.innerHTML = "";
+    return;
+  }
+  // Nur bei geändertem Inhalt neu bauen (sonst klappen offene Details alle 30 s zu)
+  const sig = `${tone}|${title}|${raws.join("|")}`;
+  if (sig === state.bannerSig && !els.errorBanner.hidden) return;
+  state.bannerSig = sig;
+  const friendly = [...new Set(raws.map(friendlyError))];
+  els.errorBanner.dataset.tone = tone;
+  els.errorBanner.innerHTML = `
+    <div class="alert-body">
+      <strong class="alert-title">${escapeHtml(title)}</strong>
+      ${friendly.length ? `<ul class="alert-list">${friendly.map((f) => `<li>${escapeHtml(f)}</li>`).join("")}</ul>` : ""}
+      ${raws.length ? `<details class="alert-details"><summary>Technische Details</summary><pre>${escapeHtml(raws.join("\n"))}</pre></details>` : ""}
+    </div>
+    <button type="button" class="alert-close" aria-label="Hinweis schließen">×</button>
+  `;
+  els.errorBanner.hidden = false;
+  els.errorBanner.querySelector(".alert-close").addEventListener("click", () => {
+    if (state.actionError) {
+      state.actionError = null;
+    } else if (state.data) {
+      state.dismissedFetchSig = (state.data.last_errors || []).join("|");
+    }
+    renderBanner();
+  });
+}
+
+/* ---------- Laufende Hintergrundabrufe sichtbar machen ---------- */
+
+function isRefreshing() {
+  return state.pending.refresh || !!(state.data && state.data.refreshing);
+}
+
+function isBackfilling() {
+  return state.pending.backfill || !!(state.data && state.data.backfilling);
+}
+
+function setBtnBusy(btn, busy, idleLabel, busyLabel) {
+  btn.disabled = busy;
+  btn.classList.toggle("is-loading", busy);
+  btn.setAttribute("aria-busy", busy ? "true" : "false");
+  const label = btn.querySelector(".ka-btn-label");
+  if (label) label.textContent = busy ? busyLabel : idleLabel;
+  else btn.textContent = busy ? busyLabel : idleLabel;
+}
+
+function renderBusy() {
+  setBtnBusy(els.refreshBtn, isRefreshing(), "Aktualisieren", "Aktualisiere …");
+  const bf = isBackfilling();
+  setBtnBusy(els.runBackfillBtn, bf, "14-Tage-Backfill aus CLOB laden", "Backfill läuft …");
+  setBtnBusy(els.runBackfillQuick, bf, "14T-Backfill aktualisieren", "Backfill läuft …");
 }
 
 function showToast(msg) {
@@ -213,28 +366,86 @@ function resolveCompareCurve(gpu) {
   return null;
 }
 
+/* ---------- Laufzeiten relativ zu heute statt fest im Code ---------- */
+
+function todayIso() {
+  return (state.data && state.data.today_utc) || new Date().toISOString().slice(0, 10);
+}
+
+function addMonthsIso(iso, months) {
+  const [y, m, d] = iso.slice(0, 10).split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1 + months, Math.min(d, 28))).toISOString().slice(0, 10);
+}
+
+function nearestByDate(items, getDate, targetIso) {
+  const target = Date.parse(targetIso);
+  let best = null;
+  let bestDist = Infinity;
+  for (const item of items) {
+    const dist = Math.abs(Date.parse(getDate(item)) - target);
+    if (dist < bestDist) { bestDist = dist; best = item; }
+  }
+  return best;
+}
+
+/* ---------- Legende zum Hauptchart ---------- */
+
+function legendSwatch({ kind, color, dash }) {
+  if (kind === "band") {
+    return `<svg class="legend-swatch" viewBox="0 0 22 10" aria-hidden="true"><rect x="0" y="1" width="22" height="8" rx="2" fill="${color}"/></svg>`;
+  }
+  const dashAttr = dash ? ` stroke-dasharray="${dash}"` : "";
+  return `<svg class="legend-swatch" viewBox="0 0 22 10" aria-hidden="true"><line x1="1" y1="5" x2="21" y2="5" stroke="${color}" stroke-width="2"${dashAttr}/></svg>`;
+}
+
+function renderChartLegend(gpu, compareCurve) {
+  const color = gpu.meta.color;
+  const band = gpu.meta.band_rgb;
+  const items = [
+    { term: "spot", label: "Spot-Historie (Ornn)", sw: { kind: "line", color } },
+    { term: "median", label: "Forward-Kurve (Median)", sw: { kind: "line", color, dash: "3 4" } },
+    { term: "spot", label: "Spotpreis heute", sw: { kind: "line", color: "var(--text-dimmed)", dash: "4 4" } },
+  ];
+  if (state.showIqr) items.push({ term: "iqr", label: "P25 bis P75", sw: { kind: "band", color: `rgba(${band}, 0.34)` } });
+  if (state.showOuter) items.push({ term: "outer", label: "P10 bis P90", sw: { kind: "band", color: `rgba(${band}, 0.16)` } });
+  if (state.showMeanTrimmed) items.push({ term: "meanTrimmed", label: "Kern-Mean", sw: { kind: "line", color: "#22d3ee", dash: "4 3" } });
+  if (state.showMeanRaw) items.push({ term: "meanRaw", label: "Roh-Mean", sw: { kind: "line", color: "var(--text-muted)", dash: "2 3" } });
+  if (compareCurve) {
+    items.push({ term: "compareCurve", label: `Vergleich: ${compareCurve.label}`, sw: { kind: "line", color: "var(--accent-amber)", dash: "6 4" } });
+  }
+  els.chartLegend.innerHTML = `
+    ${items.map((it) => `<span class="legend-item">${legendSwatch(it.sw)}<span data-term="${it.term}">${escapeHtml(it.label)}</span></span>`).join("")}
+    <span class="legend-hint">Klick rechts von „Heute“ wählt einen Liefermonat</span>
+  `;
+}
+
 function renderTopbar() {
   const data = state.data;
   if (!data) return;
 
   els.freshnessDot.classList.remove("is-stale", "is-busy");
-  if (data.refreshing || data.backfilling) {
+  const interval = data.interval_min || 15;
+  const parts = [];
+  if (data.last_captured_at) parts.push(`Letzter Datenabruf: ${fmtTs(data.last_captured_at)}`);
+  parts.push(`Automatische Aktualisierung alle ${interval} Min.`);
+  parts.push(`${data.db_stats.total_snapshots} gespeicherte Snapshots`);
+  els.freshnessBadge.title = parts.join(" · ");
+
+  if (isRefreshing() || isBackfilling()) {
     els.freshnessDot.classList.add("is-busy");
-    els.freshnessText.textContent = data.backfilling ? "Backfill läuft..." : "Aktualisiere...";
+    els.freshnessText.textContent = isBackfilling() && !isRefreshing() ? "Backfill läuft …" : "Aktualisiere …";
   } else if (data.last_captured_at) {
-    const ageMin = Math.round((Date.now() - new Date(data.last_captured_at).getTime()) / 60000);
-    if (ageMin > 60) els.freshnessDot.classList.add("is-stale");
-    els.freshnessText.textContent = `Stand ${fmtTs(data.last_captured_at)} · ${data.db_stats.total_snapshots} Snaps`;
+    const ageMin = (Date.now() - new Date(data.last_captured_at).getTime()) / 60000;
+    if (ageMin > interval * 2) els.freshnessDot.classList.add("is-stale");
+    const next = data.next_refresh_at ? ` · nächstes Update ${fmtUntil(data.next_refresh_at)}` : "";
+    els.freshnessText.textContent = `Stand ${fmtAgo(data.last_captured_at)}${next}`;
   } else {
     els.freshnessDot.classList.add("is-stale");
-    els.freshnessText.textContent = "Kein Datenstand";
+    els.freshnessText.textContent = "Noch kein Datenstand";
   }
 
-  if (data.last_errors && data.last_errors.length) {
-    showError(`Hinweis vom letzten Abruf: ${data.last_errors.join(" | ")}`);
-  } else {
-    showError("");
-  }
+  renderBanner();
+  renderBusy();
 }
 
 function renderGpuTabs() {
@@ -255,7 +466,7 @@ function renderGpuTabs() {
       <span class="gpu-tab-top">
         <span class="gpu-dot"></span>
         <span class="gpu-name">${escapeHtml(gpu.meta.label)}</span>
-        <span class="gpu-sub-tag mono">${slope !== null ? `Slope ${fmtPct(slope)}` : ""}</span>
+        <span class="gpu-sub-tag mono"${slope !== null ? ' data-term="slope"' : ""}>${slope !== null ? `Slope ${fmtPct(slope)}` : ""}</span>
       </span>
       <span class="gpu-tab-bottom">
         <span class="gpu-price">${fmtUsd(gpu.spot_price)}</span>
@@ -267,7 +478,13 @@ function renderGpuTabs() {
 
 function renderCurveView(gpu) {
   // Hero KPIs
-  const spotTime = gpu.spot_updated_at ? fmtTs(gpu.spot_updated_at) : "Ornn OCPI";
+  // Tagesschlüsse sind reine Daten (YYYY-MM-DD); fmtTs würde daraus "01:00 Uhr" Ortszeit machen
+  let spotTime = "Ornn OCPI";
+  if (gpu.spot_updated_at) {
+    spotTime = gpu.spot_source === "ornn-daily"
+      ? `Tagesschluss ${fmtDateShort(gpu.spot_updated_at)}`
+      : fmtTs(gpu.spot_updated_at);
+  }
   els.heroKicker.textContent = `Ornn Compute Price Index · ${gpu.meta.full_name} · ${spotTime}`;
   els.heroPrice.textContent = fmtUsd(gpu.spot_price);
 
@@ -280,7 +497,10 @@ function renderCurveView(gpu) {
 
   const exps = gpu.expiries || [];
   const front = exps[0] || null;
-  const mid = exps.find((e) => e.slug.includes("june-2027")) || exps[Math.floor(exps.length / 2)] || null;
+  // Mittelstrecke: Liefermonat nahe "heute + 6 Monate" (statt fest "Juni 27")
+  const mid = exps.length >= 3
+    ? nearestByDate(exps.slice(1, -1), (e) => e.delivery_date, addMonthsIso(todayIso(), 6))
+    : exps[Math.floor(exps.length / 2)] || null;
   const back = exps[exps.length - 1] || null;
 
   const setTile = (lEl, vEl, sEl, exp, fallback) => {
@@ -293,7 +513,7 @@ function renderCurveView(gpu) {
     lEl.textContent = `Forward ${exp.short_label}`;
     vEl.textContent = fmtUsd(exp.median);
     const d1 = exp.delta_1d_usd !== null ? ` · 1T ${fmtSignedUsd(exp.delta_1d_usd)}` : "";
-    sEl.innerHTML = `<span class="${deltaClass(exp.vs_spot_pct)}">${fmtPct(exp.vs_spot_pct)}</span>${d1}`;
+    sEl.innerHTML = `<span class="${deltaClass(exp.vs_spot_pct)}" data-term="vsSpot">${fmtPct(exp.vs_spot_pct)}</span>${d1}`;
   };
 
   setTile(els.kpiFrontLabel, els.kpiFrontVal, els.kpiFrontSub, front, "Front-Monat");
@@ -338,6 +558,8 @@ function renderCurveView(gpu) {
 
   // Chart rendern
   const selectedExp = getSelectedExpiry(gpu);
+  const compareCurve = resolveCompareCurve(gpu);
+  renderChartLegend(gpu, compareCurve);
   renderForwardChart({
     svg: els.forwardChartSvg,
     stage: els.forwardChartStage,
@@ -345,7 +567,7 @@ function renderCurveView(gpu) {
     gpuData: gpu,
     todayUtc: state.data ? state.data.today_utc : null,
     selectedExpirySlug: selectedExp ? selectedExp.slug : null,
-    compareCurve: resolveCompareCurve(gpu),
+    compareCurve,
     historyWindow: state.historyWindow,
     showIqr: state.showIqr,
     showOuter: state.showOuter,
@@ -355,6 +577,7 @@ function renderCurveView(gpu) {
       state.selectedExpiryByGpu[gpu.meta.key] = slug;
       state.selectedStrikeTokenId = null;
       els.strikeHistoryBox.hidden = true;
+      saveSettings();
       renderCurveView(gpu);
     },
   });
@@ -387,6 +610,7 @@ function renderCurveView(gpu) {
       state.selectedExpiryByGpu[gpu.meta.key] = exp.slug;
       state.selectedStrikeTokenId = null;
       els.strikeHistoryBox.hidden = true;
+      saveSettings();
       renderCurveView(gpu);
     });
     els.expiryStrip.appendChild(btn);
@@ -409,7 +633,7 @@ function renderDistributionAndStrikes(gpu, exp) {
   }
 
   els.distTitle.textContent = `Implizite Verteilung · ${gpu.meta.label} ${exp.month_label}`;
-  els.distSub.textContent = `${exp.strike_count} binäre Polymarket-Strikes · PAVA-monoton geglättet`;
+  els.distSub.textContent = `Aus ${exp.strike_count} Ja/Nein-Wetten auf Polymarket berechnet · Balkenfläche = Wahrscheinlichkeit`;
   els.distSkewBadge.textContent = exp.skew_spread !== null
     ? `Tail-Skew ${fmtSignedUsd(exp.skew_spread)}`
     : "Skew k. A.";
@@ -417,19 +641,19 @@ function renderDistributionAndStrikes(gpu, exp) {
   const bandLbl = exp.trimmed_band_label ? ` (${escapeHtml(exp.trimmed_band_label)})` : "";
   els.distMetrics.innerHTML = `
     <div class="mini-tile">
-      <div class="mini-tile-label">Median (P50)</div>
+      <div class="mini-tile-label"><span data-term="median">Median (P50)</span></div>
       <div class="mini-tile-val">${fmtUsd(exp.median)}</div>
     </div>
     <div class="mini-tile">
-      <div class="mini-tile-label">Kern-Mean${bandLbl}</div>
+      <div class="mini-tile-label"><span data-term="meanTrimmed">Kern-Mean${bandLbl}</span></div>
       <div class="mini-tile-val">${fmtUsd(exp.mean_trimmed)}</div>
     </div>
     <div class="mini-tile">
-      <div class="mini-tile-label">Roh-Mean (inkl. Tail)</div>
+      <div class="mini-tile-label"><span data-term="meanRaw">Roh-Mean (inkl. Tail)</span></div>
       <div class="mini-tile-val">${fmtUsd(exp.mean_raw)}</div>
     </div>
     <div class="mini-tile">
-      <div class="mini-tile-label">IQR (P25 bis P75)</div>
+      <div class="mini-tile-label"><span data-term="iqr">IQR (P25 bis P75)</span></div>
       <div class="mini-tile-val">${fmtUsd(exp.p25)} bis ${fmtUsd(exp.p75)}</div>
     </div>
   `;
@@ -453,8 +677,8 @@ function renderDistributionAndStrikes(gpu, exp) {
 
   els.strikesCaption.textContent = `Strike-Leiter · ${exp.short_label} (${exp.strike_count} Strikes)`;
   els.strikesQualityPill.textContent = exp.arbitrage_violations > 0
-    ? `${exp.arbitrage_violations} Zacken geglättet`
-    : "Sauber monoton";
+    ? `${exp.arbitrage_violations} Ausreißer geglättet`
+    : "Keine Glättung nötig";
 
   els.strikesTbody.innerHTML = "";
   for (const s of exp.strikes || []) {
@@ -502,7 +726,7 @@ async function loadStrikeHistory(gpu, exp, strikeObj) {
   renderDistributionAndStrikes(gpu, exp);
   els.strikeHistoryBox.hidden = false;
   els.strikeHistoryTitle.textContent = `${gpu.meta.label} ${exp.short_label} · ${strikeObj.title}`;
-  els.strikeHistorySub.textContent = "Lade 30-Tage-CLOB-Verlauf...";
+  els.strikeHistorySub.textContent = "Lade 30-Tage-Verlauf …";
   els.strikeHistorySvg.innerHTML = "";
   try {
     const res = await tauriInvoke("get_strike_history", {
@@ -523,7 +747,7 @@ async function loadStrikeHistory(gpu, exp, strikeObj) {
     renderStrikeHistoryChart({ svg: els.strikeHistorySvg, points: pts, color: gpu.meta.color });
   } catch (err) {
     if (reqId !== state.strikeReqSeq) return;
-    els.strikeHistorySub.textContent = `Fehler: ${err}`;
+    els.strikeHistorySub.textContent = `Verlauf nicht verfügbar: ${friendlyError(err)}`;
   }
 }
 
@@ -549,7 +773,7 @@ function renderCompareView(gpu) {
       <div class="kpi-sub mono">${c1 ? `Basis ${fmtDateShort(c1.snapshot_date)} (${fmtUsd(c1.spot_price)})` : "Noch kein 1T-Stand"}</div>
     </article>
     <article class="ka-card kpi-tile">
-      <div class="kpi-label">Ø Kurven-Shift (1T)</div>
+      <div class="kpi-label"><span data-term="curveShift">Ø Kurven-Shift (1T)</span></div>
       <div class="kpi-val mono ${deltaClass(avg1d)}">${fmtSignedUsd(avg1d)}</div>
       <div class="kpi-sub mono">Mittel über alle Verfälle</div>
     </article>
@@ -559,7 +783,7 @@ function renderCompareView(gpu) {
       <div class="kpi-sub mono">${c7 ? `Basis ${fmtDateShort(c7.snapshot_date)} (${c7.days_ago}T)` : "Noch kein 1W-Stand"}</div>
     </article>
     <article class="ka-card kpi-tile">
-      <div class="kpi-label">Ø Kurven-Shift (1W)</div>
+      <div class="kpi-label"><span data-term="curveShift">Ø Kurven-Shift (1W)</span></div>
       <div class="kpi-val mono ${deltaClass(avg7d)}">${fmtSignedUsd(avg7d)}</div>
       <div class="kpi-sub mono">Mittel über alle Verfälle</div>
     </article>
@@ -604,14 +828,39 @@ function renderMatrixView() {
   const h100Spot = data.gpus.H100 ? data.gpus.H100.spot_price : null;
   els.matrixTbody.innerHTML = "";
 
+  // Liefermonat-Spalten relativ zu heute: ~6 Monate, ~12 Monate, längste Laufzeit
+  const allExps = data.gpu_order.flatMap((k) => (data.gpus[k] && data.gpus[k].expiries) || []);
+  const allDates = [...new Set(allExps.map((e) => e.delivery_date))].sort();
+  const laterDates = allDates.slice(1);
+  const colDates = [];
+  const addCol = (iso) => { if (iso && !colDates.includes(iso)) colDates.push(iso); };
+  addCol(nearestByDate(laterDates, (d) => d, addMonthsIso(todayIso(), 6)));
+  addCol(nearestByDate(laterDates, (d) => d, addMonthsIso(todayIso(), 12)));
+  addCol(laterDates[laterDates.length - 1]);
+  colDates.sort();
+  const colMeta = colDates.map((iso) => allExps.find((e) => e.delivery_date === iso));
+
+  els.matrixHeadRow.innerHTML = `
+    <th scope="col">GPU</th>
+    <th scope="col" class="num"><span data-term="spot">Spot</span></th>
+    <th scope="col" class="num">1T</th>
+    <th scope="col" class="num">7T</th>
+    <th scope="col" class="num">30T</th>
+    <th scope="col" class="num"><span data-term="front">Front</span></th>
+    ${colMeta.map((e) => `<th scope="col" class="num"><span data-term="median">${escapeHtml(e.short_label)}</span></th>`).join("")}
+    <th scope="col" class="num"><span data-term="slope">Slope</span></th>
+    <th scope="col" class="num"><span data-term="vsH100">vs. H100</span></th>
+    <th scope="col" class="num"><span data-term="marketDepth">Liquidität</span></th>
+  `;
+
   for (const key of data.gpu_order) {
     const g = data.gpus[key];
     if (!g) continue;
-    const findExp = (sub) => (g.expiries || []).find((e) => e.slug.includes(sub));
     const front = (g.expiries || [])[0] || null;
-    const jun27 = findExp("june-2027");
-    const dec27 = findExp("december-2027");
-    const dec28 = findExp("december-2028");
+    const colCells = colDates.map((iso) => {
+      const e = (g.expiries || []).find((x) => x.delivery_date === iso);
+      return `<td class="num">${e ? fmtUsd(e.median) : "k. A."}</td>`;
+    }).join("");
     const ratio = h100Spot && g.spot_price ? `${(g.spot_price / h100Spot).toFixed(2).replace(".", ",")}x` : "k. A.";
 
     const tr = document.createElement("tr");
@@ -627,9 +876,7 @@ function renderMatrixView() {
       <td class="num ${deltaClass(g.change_7d_pct)}">${fmtPct(g.change_7d_pct)}</td>
       <td class="num ${deltaClass(g.change_30d_pct)}">${fmtPct(g.change_30d_pct)}</td>
       <td class="num">${front ? fmtUsd(front.median) : "k. A."}</td>
-      <td class="num">${jun27 ? fmtUsd(jun27.median) : "k. A."}</td>
-      <td class="num">${dec27 ? fmtUsd(dec27.median) : "k. A."}</td>
-      <td class="num">${dec28 ? fmtUsd(dec28.median) : "k. A."}</td>
+      ${colCells}
       <td class="num ${deltaClass(g.slope_to_back_pct)}">${fmtPct(g.slope_to_back_pct)}</td>
       <td class="num">${ratio}</td>
       <td class="num">${fmtCompactUsd(g.total_liquidity)}</td>
@@ -657,6 +904,13 @@ function renderMatrixView() {
   }
 }
 
+function fmtFileSize(kb) {
+  if (kb === null || kb === undefined || Number.isNaN(kb)) return "k. A.";
+  if (kb >= 1024 * 1024) return `${(kb / 1024 / 1024).toFixed(2).replace(".", ",")} GB`;
+  if (kb >= 1024) return `${(kb / 1024).toFixed(1).replace(".", ",")} MB`;
+  return `${Math.round(kb)} KB`;
+}
+
 function renderStoreView() {
   const data = state.data;
   if (!data) return;
@@ -664,7 +918,7 @@ function renderStoreView() {
 
   els.storeKpiGrid.innerHTML = `
     <article class="ka-card kpi-tile">
-      <div class="kpi-label">Gespeicherte Kurven</div>
+      <div class="kpi-label"><span data-term="snapshot">Gespeicherte Kurven</span></div>
       <div class="kpi-val mono">${db.total_snapshots}</div>
       <div class="kpi-sub mono">${db.live_snapshots} Live · ${db.backfill_snapshots} Backfill</div>
     </article>
@@ -680,8 +934,8 @@ function renderStoreView() {
     </article>
     <article class="ka-card kpi-tile">
       <div class="kpi-label">SQLite-Dateigröße</div>
-      <div class="kpi-val mono">${db.size_kb} KB</div>
-      <div class="kpi-sub mono">Auto-Snapshot alle ${data.interval_min} Min.</div>
+      <div class="kpi-val mono">${fmtFileSize(db.size_kb)}</div>
+      <div class="kpi-sub mono">Snapshot alle ${data.interval_min} Min., nach 48 Std. 1 je Tag</div>
     </article>
   `;
 
@@ -727,10 +981,10 @@ function renderAll() {
   } else if (state.activeView === "store") {
     renderStoreView();
   }
+  annotateTerms();
 }
 
-function switchView(viewKey, focusTab = false) {
-  state.activeView = viewKey;
+function applyViewTabs(viewKey, focusTab = false) {
   const tabs = Array.from(els.viewTablist.querySelectorAll('[role="tab"]'));
   for (const tab of tabs) {
     const active = tab.dataset.view === viewKey;
@@ -742,6 +996,12 @@ function switchView(viewKey, focusTab = false) {
   for (const [k, panel] of Object.entries(els.panels)) {
     panel.hidden = k !== viewKey;
   }
+}
+
+function switchView(viewKey, focusTab = false) {
+  state.activeView = viewKey;
+  applyViewTabs(viewKey, focusTab);
+  saveSettings();
   renderAll();
 }
 
@@ -753,6 +1013,7 @@ function selectGpu(gpuKey, focusTab = false) {
   if (state.compareMode === "custom") state.compareMode = "none";
   state.selectedStrikeTokenId = null;
   els.strikeHistoryBox.hidden = true;
+  saveSettings();
   renderAll();
   const tab = document.getElementById(`tab-${gpuKey}`);
   if (tab) {
@@ -761,54 +1022,74 @@ function selectGpu(gpuKey, focusTab = false) {
   }
 }
 
+/** Gespeicherte Einstellungen in Schalter und Segment-Buttons spiegeln. */
+function syncControlsFromState() {
+  els.optIqr.checked = state.showIqr;
+  els.optOuter.checked = state.showOuter;
+  els.optMeanTrimmed.checked = state.showMeanTrimmed;
+  els.optMeanRaw.checked = state.showMeanRaw;
+  document.querySelectorAll("[data-hist]").forEach((b) => {
+    b.classList.toggle("is-active", b.dataset.hist === state.historyWindow);
+  });
+  applyViewTabs(state.activeView);
+}
+
 async function loadState() {
   try {
     state.data = await tauriInvoke("get_dashboard_state");
     renderAll();
   } catch (err) {
-    showError(`Status konnte nicht geladen werden: ${err}`);
+    setActionError("Daten konnten nicht geladen werden.", err);
   }
 }
 
+const isAlreadyRunning = (err) => String(err).includes("läuft bereits");
+
 async function triggerRefresh() {
-  els.refreshBtn.disabled = true;
-  els.refreshBtn.classList.add("is-loading");
+  if (isRefreshing()) return;
+  state.pending.refresh = true;
+  renderTopbar();
   try {
     const res = await tauriInvoke("refresh_now");
     if (res && res.state) {
       state.data = res.state;
+      clearActionError();
       renderAll();
-      showToast(`Aktualisiert: ${res.saved_curves} Kurven und ${res.saved_daily} Spot-Punkte gespeichert.`);
+      const issues = res.errors && res.errors.length ? ` ${res.errors.length} Quelle(n) mit Hinweis, siehe oben.` : "";
+      showToast(`Aktualisiert: ${res.saved_curves} Kurven und ${res.saved_daily} Spot-Punkte gespeichert.${issues}`);
     }
   } catch (err) {
-    showError(`Aktualisierung fehlgeschlagen: ${err}`);
+    if (isAlreadyRunning(err)) showToast("Eine Aktualisierung läuft bereits, die neuen Daten erscheinen gleich.");
+    else setActionError("Aktualisierung fehlgeschlagen, angezeigt wird der zuletzt gespeicherte Stand.", err);
   } finally {
-    els.refreshBtn.disabled = false;
-    els.refreshBtn.classList.remove("is-loading");
+    state.pending.refresh = false;
+    renderTopbar();
   }
 }
 
 async function triggerBackfill() {
-  els.runBackfillBtn.disabled = true;
-  els.runBackfillBtn.classList.add("is-loading");
-  els.runBackfillQuick.disabled = true;
-  showToast("Lade 14-Tage-CLOB-Historie für Tages- und Wochenvergleiche...");
+  if (isBackfilling()) return;
+  state.pending.backfill = true;
+  renderTopbar();
+  showToast("Lade die letzten 14 Tage aus dem Polymarket-Kursverlauf …");
   try {
     const res = await tauriInvoke("backfill_history", { days: 14 });
     if (res && res.state) {
       state.data = res.state;
-      renderAll();
       if (res.errors && res.errors.length) {
-        showError(`Backfill-Teilfehler: ${res.errors.join(" | ")}`);
+        setActionError("Backfill unvollständig: Einige Kursverläufe fehlen, die übrigen Tage wurden gespeichert.", res.errors);
+      } else {
+        clearActionError();
       }
+      renderAll();
       showToast(`Backfill fertig: ${res.saved_days} Kurventage aus ${res.strikes_fetched} Strikes gespeichert.`);
     }
   } catch (err) {
-    showError(`Backfill fehlgeschlagen: ${err}`);
+    if (isAlreadyRunning(err)) showToast("Der Backfill läuft bereits im Hintergrund.");
+    else setActionError("Backfill fehlgeschlagen.", err);
   } finally {
-    els.runBackfillBtn.disabled = false;
-    els.runBackfillBtn.classList.remove("is-loading");
-    els.runBackfillQuick.disabled = false;
+    state.pending.backfill = false;
+    renderTopbar();
   }
 }
 
@@ -817,7 +1098,7 @@ async function handleExport(gpuKey) {
     const res = await tauriInvoke("export_csv", { gpu: gpuKey });
     showToast(`CSV gespeichert (${res.rows} Zeilen): ${res.path}`);
   } catch (err) {
-    showError(`CSV-Export fehlgeschlagen: ${err}`);
+    setActionError("CSV-Export fehlgeschlagen.", err);
   }
 }
 
@@ -840,6 +1121,7 @@ function wireTabKeyboard(container, onSelect) {
 }
 
 function setupEvents() {
+  installTermTooltips();
   wireTabKeyboard(els.viewTablist, (tab, focus) => switchView(tab.dataset.view, focus));
   wireTabKeyboard(els.gpuTablist, (tab, focus) => selectGpu(tab.dataset.gpu, focus));
 
@@ -847,6 +1129,7 @@ function setupEvents() {
     btn.addEventListener("click", () => {
       state.historyWindow = btn.dataset.hist;
       document.querySelectorAll("[data-hist]").forEach((b) => b.classList.toggle("is-active", b === btn));
+      saveSettings();
       const gpu = getCurrentGpu();
       if (gpu) renderCurveView(gpu);
     });
@@ -885,33 +1168,29 @@ function setupEvents() {
         state.customCompareSnapshot = snap;
         const gpu = getCurrentGpu();
         if (gpu) renderCurveView(gpu);
+      } else if (!snap) {
+        setActionError("Dieser Snapshot ist nicht mehr gespeichert.", []);
+        const gpu = getCurrentGpu();
+        if (gpu) renderCurveView(gpu);
       }
     } catch (err) {
       if (reqId !== state.compareReqSeq) return;
-      showError(`Snapshot konnte nicht geladen werden: ${err}`);
+      setActionError("Snapshot konnte nicht geladen werden.", err);
     }
   });
 
-  els.optIqr.addEventListener("change", () => {
-    state.showIqr = els.optIqr.checked;
-    const gpu = getCurrentGpu();
-    if (gpu) renderCurveView(gpu);
-  });
-  els.optOuter.addEventListener("change", () => {
-    state.showOuter = els.optOuter.checked;
-    const gpu = getCurrentGpu();
-    if (gpu) renderCurveView(gpu);
-  });
-  els.optMeanTrimmed.addEventListener("change", () => {
-    state.showMeanTrimmed = els.optMeanTrimmed.checked;
-    const gpu = getCurrentGpu();
-    if (gpu) renderCurveView(gpu);
-  });
-  els.optMeanRaw.addEventListener("change", () => {
-    state.showMeanRaw = els.optMeanRaw.checked;
-    const gpu = getCurrentGpu();
-    if (gpu) renderCurveView(gpu);
-  });
+  const bindToggle = (input, key) => {
+    input.addEventListener("change", () => {
+      state[key] = input.checked;
+      saveSettings();
+      const gpu = getCurrentGpu();
+      if (gpu) renderCurveView(gpu);
+    });
+  };
+  bindToggle(els.optIqr, "showIqr");
+  bindToggle(els.optOuter, "showOuter");
+  bindToggle(els.optMeanTrimmed, "showMeanTrimmed");
+  bindToggle(els.optMeanRaw, "showMeanRaw");
 
   els.refreshBtn.addEventListener("click", triggerRefresh);
   els.runBackfillBtn.addEventListener("click", triggerBackfill);
@@ -940,14 +1219,29 @@ function setupEvents() {
     resizeTimer = setTimeout(() => renderAll(), 120);
   });
 
-  // Hintergrund-Updates aus Rust (Initial-Abruf, 14T-Backfill, 15-Min-Poller)
+  // Relative Zeitangaben ("vor 4 Min.") laufend aktuell halten
+  setInterval(() => { if (state.data) renderTopbar(); }, 30_000);
+
+  // Hintergrund-Updates aus Rust (Start-Abruf, Backfill, 15-Min-Poller)
   tauriListen("compute:updated", (event) => {
     if (event && event.payload) {
       state.data = event.payload;
       renderAll();
     }
   });
+
+  // Start/Ende eines Abrufs oder Backfills: Buttons sperren statt "läuft bereits"-Fehler
+  tauriListen("compute:busy", (event) => {
+    const p = event && event.payload;
+    if (!p || !state.data) return;
+    state.data.refreshing = !!p.refreshing;
+    state.data.backfilling = !!p.backfilling;
+    state.data.next_refresh_at = p.next_refresh_at || null;
+    renderTopbar();
+  });
 }
 
+loadSettings();
+syncControlsFromState();
 setupEvents();
 loadState();

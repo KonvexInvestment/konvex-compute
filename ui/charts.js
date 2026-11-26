@@ -342,7 +342,7 @@ export function renderForwardChart(config) {
     }
   }
 
-  // Kern-Erwartungswert (P5 bis P95)
+  // Kern-Erwartungswert (mindestens P5 bis P95, je nach Strike-Abdeckung enger)
   if (showMeanTrimmed && expiries.length) {
     const pts = [];
     if (anchorY !== null) pts.push(`${anchorX.toFixed(1)},${anchorY.toFixed(1)}`);
@@ -620,6 +620,13 @@ export function renderForwardChart(config) {
   });
 }
 
+/** Deutsches Bucket-Label aus den Grenzen (das gespeicherte Rust-Label nutzt Dezimalpunkte). */
+function bucketLabel(b) {
+  if (b.high === null || b.high === undefined) return `über ${fmtUsd(b.low)}`;
+  if (b.is_tail) return `unter ${fmtUsd(b.high)}`;
+  return `${fmtUsd(b.low)} bis ${fmtUsd(b.high)}`;
+}
+
 export function renderDistributionChart({ svg, stage, tooltip, expiry, spotPrice, color, bandRgb }) {
   svg.innerHTML = "";
   tooltip.hidden = true;
@@ -633,62 +640,121 @@ export function renderDistributionChart({ svg, stage, tooltip, expiry, spotPrice
     return;
   }
 
-  const pad = { top: 20, right: 14, bottom: 40, left: 40 };
-  const plotW = width - pad.left - pad.right;
-  const plotH = height - pad.top - pad.bottom;
-
-  const maxProb = Math.max(0.05, ...buckets.map((b) => b.prob));
-  const yMax = Math.ceil((maxProb * 100) / 5) * 5;
-  const yScale = (pct) => pad.top + plotH - (pct / Math.max(5, yMax)) * plotH;
-
-  for (let i = 0; i <= 4; i++) {
-    const pct = (yMax / 4) * i;
-    const yy = yScale(pct);
-    svg.appendChild(el("line", { x1: pad.left, x2: pad.left + plotW, y1: yy, y2: yy, stroke: "var(--chart-grid)", "stroke-width": 1 }));
-    svg.appendChild(el("text", { x: pad.left - 6, y: yy + 3.5, "text-anchor": "end", fill: "var(--text-muted)", "font-size": 10, "font-family": "var(--font-mono)" }, `${Math.round(pct)} %`));
-  }
-
-  const n = buckets.length;
-  const slotW = plotW / n;
-  const barW = Math.max(5, slotW - 5);
-
-  buckets.forEach((b, idx) => {
-    const pct = b.prob * 100;
-    const bx = pad.left + idx * slotW + (slotW - barW) / 2;
-    const by = yScale(pct);
-    const bh = Math.max(1, pad.top + plotH - by);
-    // Markiere echte Überlappung des Buckets mit dem Interquartilsbereich [P25, P75]
-    const overlapsIqr =
-      expiry.p25 !== null &&
-      expiry.p75 !== null &&
-      (b.low === null || b.low < expiry.p75) &&
-      (b.high === null || b.high > expiry.p25);
-
-    const rect = el("rect", {
-      x: bx, y: by, width: barW, height: bh, rx: 2.5,
-      fill: overlapsIqr ? color : `rgba(${bandRgb}, 0.32)`,
-      stroke: overlapsIqr ? color : `rgba(${bandRgb}, 0.65)`,
-      "stroke-width": 1, style: "cursor:pointer",
-    });
-
-    rect.addEventListener("mousemove", (evt) => {
-      showTooltip(tooltip, stage, evt.clientX, evt.clientY, `
-        <div class="tt-title">${escapeHtml(b.label)}</div>
-        <div class="tt-row"><span>Wahrscheinlichkeit</span><strong>${num1.format(pct)} %</strong></div>
-        <div class="tt-row"><span>Typ</span><strong>${b.is_tail ? "Randbereich" : "Intervall"}</strong></div>
-      `);
-    });
-    rect.addEventListener("mouseleave", () => { tooltip.hidden = true; });
-    svg.appendChild(rect);
-
-    const step = Math.max(1, Math.ceil(n / 6));
-    if (idx % step === 0 || idx === n - 1) {
-      const lbl = b.low !== null && b.high !== null ? `${num2.format(b.low)}` : b.label.replace(/\s*\$/g, "");
-      svg.appendChild(el("text", { x: bx + barW / 2, y: height - 22, "text-anchor": "middle", fill: "var(--text-muted)", "font-size": 9.5, "font-family": "var(--font-mono)" }, lbl));
-    }
+  // Preisachse statt gleich breiter Balken: Breite = Preisspanne, Höhe = Wahrscheinlichkeit je 1 $.
+  // Damit entspricht die Fläche der Wahrscheinlichkeit und breite Spannen wirken nicht wie ein Gipfel.
+  const interior = buckets.filter((b) => !b.is_tail && b.low !== null && b.high !== null);
+  const lastInteriorW = interior.length ? interior[interior.length - 1].high - interior[interior.length - 1].low : 0;
+  const shapes = buckets.map((b) => {
+    const open = b.high === null || b.high === undefined;
+    const lo = b.low ?? 0;
+    const hi = open ? lo + Math.max(lastInteriorW, lo * 0.15, 0.1) : b.high;
+    const w = Math.max(1e-6, hi - lo);
+    return { b, lo, hi, open, dens: b.prob / w };
   });
 
-  svg.appendChild(el("text", { x: pad.left, y: height - 5, fill: "var(--text-dimmed)", "font-size": 10.5 }, `Markiert: P25 bis P75 (${fmtUsd(expiry.p25)} bis ${fmtUsd(expiry.p75)}) · Spot: ${fmtUsd(spotPrice)}`));
+  let xMin = Math.min(...shapes.map((sh) => sh.lo));
+  let xMax = Math.max(...shapes.map((sh) => sh.hi));
+  if (spotPrice !== null && spotPrice !== undefined && Number.isFinite(spotPrice)) {
+    xMin = Math.min(xMin, spotPrice);
+    xMax = Math.max(xMax, spotPrice);
+  }
+  const xSpan = Math.max(1e-6, xMax - xMin);
+
+  const pad = { top: 24, right: 16, bottom: 40, left: 16 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  const xScale = (v) => pad.left + ((v - xMin) / xSpan) * plotW;
+  const maxDens = Math.max(1e-9, ...shapes.map((sh) => sh.dens));
+  const yScale = (d) => pad.top + plotH - (d / maxDens) * plotH;
+  const baseY = pad.top + plotH;
+
+  for (const frac of [0.25, 0.5, 0.75, 1]) {
+    const yy = pad.top + plotH - plotH * frac;
+    svg.appendChild(el("line", { x1: pad.left, x2: pad.left + plotW, y1: yy, y2: yy, stroke: "var(--chart-grid)", "stroke-width": 1 }));
+  }
+  svg.appendChild(el("line", { x1: pad.left, x2: pad.left + plotW, y1: baseY, y2: baseY, stroke: "var(--border-strong)", "stroke-width": 1 }));
+
+  const overlapsIqr = (b) =>
+    expiry.p25 !== null &&
+    expiry.p75 !== null &&
+    (b.low === null || b.low < expiry.p75) &&
+    (b.high === null || b.high > expiry.p25);
+
+  for (const sh of shapes) {
+    const x0 = xScale(sh.lo);
+    const x1 = xScale(sh.hi);
+    const bw = Math.max(1.5, x1 - x0 - 1);
+    const by = yScale(sh.dens);
+    const inIqr = overlapsIqr(sh.b);
+    svg.appendChild(el("rect", {
+      x: x0 + 0.5,
+      y: by,
+      width: bw,
+      height: Math.max(1, baseY - by),
+      rx: 1.5,
+      fill: inIqr ? color : `rgba(${bandRgb}, 0.32)`,
+      "fill-opacity": sh.b.is_tail ? 0.55 : 1,
+      stroke: inIqr ? color : `rgba(${bandRgb}, 0.65)`,
+      "stroke-width": 1,
+      "stroke-dasharray": sh.b.is_tail ? "3 2" : null,
+    }));
+  }
+
+  // Preis-Ticks
+  const tickFmt = new Intl.NumberFormat("de-DE", { maximumFractionDigits: xSpan < 3 ? 2 : xSpan < 12 ? 1 : 0 });
+  for (const t of niceTicks(xMin, xMax, Math.max(3, Math.floor(plotW / 70)))) {
+    if (t < xMin - 1e-9 || t > xMax + 1e-9) continue;
+    const xx = xScale(t);
+    svg.appendChild(el("line", { x1: xx, x2: xx, y1: baseY, y2: baseY + 4, stroke: "var(--border-strong)", "stroke-width": 1 }));
+    svg.appendChild(el("text", { x: xx, y: baseY + 15, "text-anchor": "middle", fill: "var(--text-muted)", "font-size": 9.5, "font-family": "var(--font-mono)" }, `${tickFmt.format(t)} $`));
+  }
+
+  // Markierungen: Median und heutiger Spot
+  // (Spot neutral grau gestrichelt wie im Hauptchart, damit er nie mit der GPU-Farbe verschmilzt)
+  const markers = [];
+  if (expiry.median !== null && expiry.median !== undefined) markers.push({ v: expiry.median, label: "Median", stroke: "var(--text-primary)", dash: null });
+  if (spotPrice !== null && spotPrice !== undefined) markers.push({ v: spotPrice, label: "Spot heute", stroke: "var(--text-muted)", dash: "4 3" });
+  markers.sort((a, b) => a.v - b.v);
+  const xs = markers.map((m) => xScale(m.v));
+  const close = xs.length === 2 && xs[1] - xs[0] < 120;
+  markers.forEach((m, i) => {
+    const xx = xs[i];
+    svg.appendChild(el("line", { x1: xx, x2: xx, y1: pad.top - 6, y2: baseY, stroke: m.stroke, "stroke-width": 1.3, "stroke-dasharray": m.dash, "stroke-opacity": 0.9 }));
+    // Nahe Markierungen: linke Beschriftung nach links, rechte nach rechts
+    let anchor = "middle";
+    let lx = xx;
+    if (close) {
+      anchor = i === 0 ? "end" : "start";
+      lx = i === 0 ? xx - 3 : xx + 3;
+    }
+    if (anchor === "middle" && xx > pad.left + plotW - 45) anchor = "end";
+    if (anchor === "middle" && xx < pad.left + 45) anchor = "start";
+    if (anchor === "end" && lx < pad.left + 70) { anchor = "start"; lx = Math.max(lx, pad.left); }
+    if (anchor === "start" && lx > pad.left + plotW - 70) { anchor = "end"; lx = Math.min(lx, pad.left + plotW); }
+    svg.appendChild(el("text", { x: lx, y: 13, "text-anchor": anchor, fill: m.stroke, "font-size": 10, "font-weight": 600 }, `${m.label} ${fmtUsd(m.v)}`));
+  });
+
+  svg.appendChild(el("text", { x: pad.left, y: height - 5, fill: "var(--text-dimmed)", "font-size": 10.5 },
+    `Hervorgehoben: P25 bis P75 (${fmtUsd(expiry.p25)} bis ${fmtUsd(expiry.p75)}) · gestrichelt: Randbereiche`));
+
+  // Hover über die ganze Fläche: findet den Bucket an der Mausposition (auch sehr schmale)
+  const overlay = el("rect", { x: pad.left, y: pad.top, width: plotW, height: plotH, fill: "transparent", style: "cursor:crosshair" });
+  overlay.addEventListener("mousemove", (evt) => {
+    const rect = svg.getBoundingClientRect();
+    const mx = ((evt.clientX - rect.left) / rect.width) * width;
+    const v = xMin + ((mx - pad.left) / plotW) * xSpan;
+    const hit = shapes.find((sh) => v >= sh.lo && v < sh.hi) || null;
+    if (!hit) { tooltip.hidden = true; return; }
+    const b = hit.b;
+    const kind = hit.open ? "Oberer Rand (nach oben offen)" : b.is_tail ? "Unterer Rand (geschätzt)" : "Preisspanne";
+    showTooltip(tooltip, stage, evt.clientX, evt.clientY, `
+      <div class="tt-title">${escapeHtml(bucketLabel(b))}</div>
+      <div class="tt-row"><span>Wahrscheinlichkeit</span><strong>${num1.format(b.prob * 100)} %</strong></div>
+      <div class="tt-row"><span>Typ</span><strong>${kind}</strong></div>
+    `);
+  });
+  overlay.addEventListener("mouseleave", () => { tooltip.hidden = true; });
+  svg.appendChild(overlay);
 }
 
 /**

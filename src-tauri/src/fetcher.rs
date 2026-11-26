@@ -195,11 +195,12 @@ fn parse_expiry_meta(slug: &str, end_date_str: Option<&str>) -> Option<ExpiryDat
 
 /// Parst die Dollar-Schwelle inkl. möglicher Tausenderkommas (z. B. "Above $1,200.50").
 fn parse_strike_dollar(text: &str) -> Option<f64> {
+    // Position nur im selben String verwenden, in dem gesucht wurde: `to_lowercase`
+    // kann Byte-Längen ändern (z. B. "İ"), ein Slice in `text` könnte sonst panicen.
     let lower = text.to_lowercase();
-    let search_slice = if let Some(pos) = lower.find("above") {
-        &text[pos..]
-    } else {
-        text
+    let search_slice = match lower.find("above") {
+        Some(pos) => &lower[pos..],
+        None => lower.as_str(),
     };
     let idx = search_slice.find('$')?;
     let after = &search_slice[idx + 1..];
@@ -433,7 +434,27 @@ pub async fn fetch_ornn_history(
     Ok(out)
 }
 
-pub async fn fetch_clob_price_history_range(
+/// Die CLOB-API lehnt `startTs`/`endTs`-Fenster ab etwa 15 Tagen mit
+/// "interval is too long" ab (unabhängig von `fidelity`). Längere Zeiträume
+/// werden deshalb in Abschnitte dieser Länge zerlegt.
+const CLOB_MAX_WINDOW_SECS: i64 = 14 * 86_400;
+
+/// Zerlegt [start_ts, end_ts] in aufeinanderfolgende Fenster von höchstens `max_len` Sekunden.
+fn split_time_windows(start_ts: i64, end_ts: i64, max_len: i64) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    if end_ts <= start_ts || max_len <= 0 {
+        return out;
+    }
+    let mut cur = start_ts;
+    while cur < end_ts {
+        let next = (cur + max_len).min(end_ts);
+        out.push((cur, next));
+        cur = next;
+    }
+    out
+}
+
+async fn fetch_clob_price_history_window(
     client: &Client,
     token_id: &str,
     start_ts: i64,
@@ -460,7 +481,24 @@ pub async fn fetch_clob_price_history_range(
             }
         }
     }
+    Ok(points)
+}
+
+pub async fn fetch_clob_price_history_range(
+    client: &Client,
+    token_id: &str,
+    start_ts: i64,
+    end_ts: i64,
+    fidelity: u32,
+) -> Result<Vec<ClobHistoryPoint>, String> {
+    let mut points = Vec::new();
+    for (win_start, win_end) in split_time_windows(start_ts, end_ts, CLOB_MAX_WINDOW_SECS) {
+        points.extend(
+            fetch_clob_price_history_window(client, token_id, win_start, win_end, fidelity).await?,
+        );
+    }
     points.sort_by_key(|pt| pt.t);
+    points.dedup_by_key(|pt| pt.t);
     Ok(points)
 }
 
@@ -509,6 +547,7 @@ pub async fn collect_full_market_bundle(client: &Client) -> FetchedMarketBundle 
 
     let catalog = gpu_catalog();
     let mut gpus_out = BTreeMap::new();
+    let today_iso = Utc::now().date_naive().format("%Y-%m-%d").to_string();
 
     for cfg in catalog {
         let (spot_res, hist_res) = tokio::join!(
@@ -553,6 +592,11 @@ pub async fn collect_full_market_bundle(client: &Client) -> FetchedMarketBundle 
             let Some(meta) = parse_expiry_meta(&slug, end_date.as_deref()) else {
                 continue;
             };
+            // Abgelaufene Liefermonate, deren Event noch auf Auflösung wartet, sind keine
+            // Forward-Punkte mehr und würden sonst links von "Heute" im Chart landen.
+            if meta.delivery_date < today_iso {
+                continue;
+            }
 
             let mut raw_strikes = Vec::new();
             if let Some(markets) = ev.get("markets").and_then(|m| m.as_array()) {
@@ -817,7 +861,7 @@ pub async fn reconstruct_daily_backfill(
                 }
 
                 // Mindestabdeckung: mindestens 4 Strikes und mindestens 50 % der heutigen Strike-Leiter
-                let min_needed = 4usize.max((exp.strikes.len() + 1) / 2);
+                let min_needed = 4usize.max(exp.strikes.len().div_ceil(2));
                 if raw_strikes.len() >= min_needed {
                     let stats = analyze_expiry_strikes(raw_strikes, spot_val);
                     if stats.median.is_some() {
@@ -888,6 +932,26 @@ mod tests {
         assert_eq!(parse_strike_dollar("Above $3.80"), Some(3.8));
         assert_eq!(parse_strike_dollar("Above $1,200.50"), Some(1200.5));
         assert_eq!(parse_strike_dollar("Will price be above $12.25?"), Some(12.25));
+        // Zeichen, deren Kleinschreibung die Byte-Länge ändert, dürfen nicht panicen
+        // (Kelvin-Zeichen: 3 Byte -> "k" mit 1 Byte; alter Code slicte mitten ins Zeichen)
+        assert_eq!(parse_strike_dollar("€\u{212A} above $2.50"), Some(2.5));
+        assert_eq!(parse_strike_dollar("İİİİİİİİİİİİ above $2.50"), Some(2.5));
+    }
+
+    #[test]
+    fn clob_windows_stay_below_api_limit() {
+        let day = 86_400;
+        // 14 Tage passen in ein Fenster, 30 Tage werden lückenlos in 3 Fenster zerlegt
+        assert_eq!(split_time_windows(0, 14 * day, CLOB_MAX_WINDOW_SECS), vec![(0, 14 * day)]);
+        let w = split_time_windows(0, 30 * day, CLOB_MAX_WINDOW_SECS);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w.first().unwrap().0, 0);
+        assert_eq!(w.last().unwrap().1, 30 * day);
+        for pair in w.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+        assert!(w.iter().all(|(a, b)| b - a <= CLOB_MAX_WINDOW_SECS));
+        assert!(split_time_windows(10, 10, CLOB_MAX_WINDOW_SECS).is_empty());
     }
 
     #[test]

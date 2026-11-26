@@ -70,7 +70,7 @@
           <!-- Hero-KPI-Grid -->
           <section class="kpi-grid">
             <article class="ka-card kpi-hero">
-              <div class="kpi-kicker" id="hero-kicker">Ornn Compute Price Index · H100 SXM</div>
+              <div class="kpi-kicker" id="hero-kicker" data-term="spot">Ornn Compute Price Index · H100 SXM</div>
               <div class="kpi-hero-row">
                 <span class="kpi-hero-val mono" id="hero-price">...</span>
                 <span class="kpi-hero-unit">/ GPU-Std.</span>
@@ -97,7 +97,7 @@
             </article>
 
             <article class="ka-card kpi-tile">
-              <div class="kpi-label">Markttiefe (Polymarket)</div>
+              <div class="kpi-label"><span data-term="marketDepth">Markttiefe (Polymarket)</span></div>
               <div class="kpi-val mono" id="kpi-liq-val">...</div>
               <div class="kpi-sub mono" id="kpi-liq-sub"></div>
             </article>
@@ -116,7 +116,7 @@
 
                 <span class="toolbar-sep" aria-hidden="true"></span>
 
-                <span class="toolbar-label">Kurvenvergleich</span>
+                <span class="toolbar-label" data-term="compareCurve">Kurvenvergleich</span>
                 <div class="seg-group" role="group" aria-label="Kurvenvergleich">
                   <button type="button" class="seg-btn is-active" data-cmp="none">Aus</button>
                   <button type="button" class="seg-btn" data-cmp="1d" id="cmp-btn-1d">1T</button>
@@ -131,22 +131,24 @@
               <div class="toolbar-cluster">
                 <label class="ka-check">
                   <input type="checkbox" id="opt-iqr" checked>
-                  <span>P25 bis P75</span>
+                  <span data-term="iqr">P25 bis P75</span>
                 </label>
                 <label class="ka-check">
                   <input type="checkbox" id="opt-outer">
-                  <span>P10 bis P90</span>
+                  <span data-term="outer">P10 bis P90</span>
                 </label>
-                <label class="ka-check" title="Bedingter Erwartungswert über den Kernbereich P5 bis P95 ohne 2-Jahres-Zinsboden-Verzerrung">
+                <label class="ka-check">
                   <input type="checkbox" id="opt-mean-trimmed">
-                  <span>Kern-Mean</span>
+                  <span data-term="meanTrimmed">Kern-Mean</span>
                 </label>
-                <label class="ka-check" title="Voller Integral-Erwartungswert inkl. oberem Tail (steigt bei langen Laufzeiten durch Rechtsschiefe und Kapitalbindungs-Boden)">
+                <label class="ka-check">
                   <input type="checkbox" id="opt-mean-raw">
-                  <span>Roh-Mean</span>
+                  <span data-term="meanRaw">Roh-Mean</span>
                 </label>
               </div>
             </div>
+
+            <div class="chart-legend" id="chart-legend" aria-label="Legende"></div>
 
             <div class="chart-stage" id="forward-chart-stage">
               <svg id="forward-chart-svg" class="chart-svg" role="img" aria-label="Historischer GPU-Spotpreis und Polymarket-Forward-Kurve"></svg>
@@ -161,10 +163,10 @@
             <article class="ka-card panel-pad">
               <div class="section-head">
                 <div>
-                  <h2 class="section-title" id="dist-title">Implizite Verteilung</h2>
+                  <h2 class="section-title" id="dist-title" data-term="distribution">Implizite Verteilung</h2>
                   <p class="section-sub" id="dist-sub">Klicke auf einen Verfall im Chart oder in der Leiste.</p>
                 </div>
-                <span class="ka-badge mono" id="dist-skew-badge">Skew</span>
+                <span class="ka-badge mono" id="dist-skew-badge" data-term="skew">Skew</span>
               </div>
 
               <div class="mini-grid" id="dist-metrics"></div>
@@ -179,24 +181,24 @@
             <article class="ka-card panel-pad">
               <div class="section-head">
                 <div>
-                  <h2 class="section-title" id="strikes-caption">Strike-Leiter</h2>
-                  <p class="section-sub">Klick auf eine Zeile lädt den 30-Tage-Wahrscheinlichkeitsverlauf aus der CLOB-API.</p>
+                  <h2 class="section-title" id="strikes-caption" data-term="strikeLadder">Strike-Leiter</h2>
+                  <p class="section-sub">Klick auf eine Zeile zeigt, wie sich die Wahrscheinlichkeit dieses Strikes in den letzten 30 Tagen entwickelt hat.</p>
                 </div>
-                <span class="ka-badge mono" id="strikes-quality-pill">PAVA</span>
+                <span class="ka-badge mono" id="strikes-quality-pill" data-term="pava">PAVA</span>
               </div>
 
               <div tabindex="0" role="region" aria-labelledby="strikes-caption" class="table-wrapper strikes-wrap">
                 <table class="ka-table strikes-table">
                   <thead>
                     <tr>
-                      <th scope="col">Strike</th>
-                      <th scope="col" class="num">P(Ja)</th>
-                      <th scope="col" class="num">PAVA</th>
-                      <th scope="col" class="num">Bid / Ask</th>
-                      <th scope="col" class="num">Spread</th>
-                      <th scope="col" class="num">24h Δ</th>
-                      <th scope="col" class="num">Liquidität</th>
-                      <th scope="col" class="num">Vol. 24h</th>
+                      <th scope="col"><span data-term="strike">Strike</span></th>
+                      <th scope="col" class="num"><span data-term="probYes">P(Ja)</span></th>
+                      <th scope="col" class="num"><span data-term="pava">Geglättet</span></th>
+                      <th scope="col" class="num"><span data-term="bidAsk">Bid / Ask</span></th>
+                      <th scope="col" class="num"><span data-term="spread">Spread</span></th>
+                      <th scope="col" class="num"><span data-term="chg24">24h Δ</span></th>
+                      <th scope="col" class="num"><span data-term="liquidity">Liquidität</span></th>
+                      <th scope="col" class="num"><span data-term="volume24">Vol. 24h</span></th>
                     </tr>
                   </thead>
                   <tbody id="strikes-tbody"></tbody>
@@ -228,10 +230,10 @@
           <section class="ka-card panel-pad">
             <div class="section-head">
               <div>
-                <h2 class="section-title" id="shift-chart-title">Kurvenverschiebung nach Laufzeit (Δ 1T vs. Δ 1W)</h2>
+                <h2 class="section-title" id="shift-chart-title" data-term="curveShift">Kurvenverschiebung nach Laufzeit (Δ 1T vs. Δ 1W)</h2>
                 <p class="section-sub" id="shift-chart-sub">Zeigt auf einen Blick, ob sich die Forward-Kurve parallel verschoben, versteilt oder abgeflacht hat.</p>
               </div>
-              <button type="button" class="ka-btn ka-btn-ghost ka-btn-xs" id="run-backfill-quick">14T-Backfill aktualisieren</button>
+              <button type="button" class="ka-btn ka-btn-ghost ka-btn-xs" id="run-backfill-quick" data-term="backfill">14T-Backfill aktualisieren</button>
             </div>
             <div class="shift-stage" id="shift-chart-stage">
               <svg id="shift-chart-svg" class="chart-svg" role="img" aria-label="Veränderung der Forward-Kurve nach Laufzeit im Tages- und Wochenvergleich"></svg>
@@ -252,16 +254,16 @@
                 <thead>
                   <tr>
                     <th scope="col">Verfall</th>
-                    <th scope="col" class="num">Aktuell (P50)</th>
+                    <th scope="col" class="num"><span data-term="median">Aktuell (P50)</span></th>
                     <th scope="col" class="num">Gestern (1T)</th>
-                    <th scope="col" class="num">Δ 1T ($)</th>
-                    <th scope="col" class="num">Δ 1T (%)</th>
+                    <th scope="col" class="num"><span data-term="delta1d">Δ 1T ($)</span></th>
+                    <th scope="col" class="num"><span data-term="delta1d">Δ 1T (%)</span></th>
                     <th scope="col" class="num">Vor 7T (1W)</th>
-                    <th scope="col" class="num">Δ 7T ($)</th>
-                    <th scope="col" class="num">Δ 7T (%)</th>
-                    <th scope="col" class="num">Kern-Mean</th>
-                    <th scope="col" class="num">Roh-Mean</th>
-                    <th scope="col" class="num">IQR</th>
+                    <th scope="col" class="num"><span data-term="delta7d">Δ 7T ($)</span></th>
+                    <th scope="col" class="num"><span data-term="delta7d">Δ 7T (%)</span></th>
+                    <th scope="col" class="num"><span data-term="meanTrimmed">Kern-Mean</span></th>
+                    <th scope="col" class="num"><span data-term="meanRaw">Roh-Mean</span></th>
+                    <th scope="col" class="num"><span data-term="iqr">IQR</span></th>
                   </tr>
                 </thead>
                 <tbody id="compare-tbody"></tbody>
@@ -278,26 +280,23 @@
             <div class="section-head">
               <div>
                 <h2 class="section-title" id="matrix-caption">Alle GPU-Forward-Kurven im Vergleich</h2>
-                <p class="section-sub">Spot, 1T/7T/30T-Veränderung, Stützstellen bis Dez. 2028, Kurvensteigung und Preisverhältnis zu H100. Klick öffnet die GPU.</p>
+                <p class="section-sub">Spot, 1T/7T/30T-Veränderung, Forward-Mediane ausgewählter Liefermonate, Kurvensteigung und Preisverhältnis zu H100. Klick öffnet die GPU.</p>
               </div>
             </div>
 
             <div tabindex="0" role="region" aria-labelledby="matrix-caption" class="table-wrapper matrix-wrap">
               <table class="ka-table matrix-table">
                 <thead>
-                  <tr>
+                  <tr id="matrix-head-row">
                     <th scope="col">GPU</th>
-                    <th scope="col" class="num">Spot</th>
+                    <th scope="col" class="num"><span data-term="spot">Spot</span></th>
                     <th scope="col" class="num">1T</th>
                     <th scope="col" class="num">7T</th>
                     <th scope="col" class="num">30T</th>
-                    <th scope="col" class="num">Front</th>
-                    <th scope="col" class="num">Juni 27</th>
-                    <th scope="col" class="num">Dez. 27</th>
-                    <th scope="col" class="num">Dez. 28</th>
-                    <th scope="col" class="num">Slope</th>
-                    <th scope="col" class="num">vs. H100</th>
-                    <th scope="col" class="num">Liquidität</th>
+                    <th scope="col" class="num"><span data-term="front">Front</span></th>
+                    <th scope="col" class="num"><span data-term="slope">Slope</span></th>
+                    <th scope="col" class="num"><span data-term="vsH100">vs. H100</span></th>
+                    <th scope="col" class="num"><span data-term="marketDepth">Liquidität</span></th>
                   </tr>
                 </thead>
                 <tbody id="matrix-tbody"></tbody>
@@ -324,7 +323,7 @@
                 <p class="section-sub mono" id="store-db-path"></p>
               </div>
               <div class="toolbar-cluster">
-                <button type="button" class="ka-btn ka-btn-primary" id="run-backfill-btn">
+                <button type="button" class="ka-btn ka-btn-primary" id="run-backfill-btn" data-term="backfill">
                   <span class="ka-spinner" aria-hidden="true"></span>
                   <span class="ka-btn-label">14-Tage-Backfill aus CLOB laden</span>
                 </button>
@@ -336,9 +335,9 @@
                 <thead>
                   <tr>
                     <th scope="col">GPU</th>
-                    <th scope="col" class="num">Spot-Tage</th>
-                    <th scope="col" class="num">Live-Snapshots</th>
-                    <th scope="col" class="num">Backfill-Tage</th>
+                    <th scope="col" class="num"><span data-term="spotDays">Spot-Tage</span></th>
+                    <th scope="col" class="num"><span data-term="snapshot">Live-Snapshots</span></th>
+                    <th scope="col" class="num"><span data-term="backfill">Backfill-Tage</span></th>
                     <th scope="col">1T-Vergleich</th>
                     <th scope="col">1W-Vergleich</th>
                     <th scope="col" class="num">Export</th>

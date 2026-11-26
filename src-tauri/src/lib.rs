@@ -8,19 +8,36 @@ use crate::fetcher::{
     reconstruct_daily_backfill,
 };
 use crate::models::{
-    BackfillSummary, ClobHistoryPoint, DashboardState, ExportResult, RefreshSummary,
+    BackfillSummary, BusyState, ClobHistoryPoint, DashboardState, ExportResult, RefreshSummary,
     SnapshotDetail, StrikeHistoryResponse,
 };
 use crate::store::ComputeStore;
 use reqwest::Client;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{watch, Mutex};
 
 const AUTO_REFRESH_MIN: u64 = 15;
+/// Automatischer Backfill beim Start höchstens so oft (füllt auch Lücken nach Tagen ohne App).
+const AUTO_BACKFILL_MIN_AGE_HOURS: i64 = 20;
+/// Takt, in dem der Hintergrund-Poller die Fälligkeit gegen die Uhrzeit prüft.
+const SCHEDULER_TICK_SECS: u64 = 30;
+
+/// True, wenn der RFC3339-Zeitstempel fehlt, unlesbar oder älter als `max_age` ist.
+fn is_older_than(ts: Option<&str>, max_age: chrono::Duration) -> bool {
+    match ts.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
+        Some(dt) => chrono::Utc::now().signed_duration_since(dt) > max_age,
+        None => true,
+    }
+}
+
+fn unix_to_rfc3339(ts: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
 
 pub struct AppState {
     pub store: ComputeStore,
@@ -31,6 +48,11 @@ pub struct AppState {
     pub backfill_lock: Mutex<()>,
     pub strike_cache: Mutex<HashMap<(String, u32, u32), (Instant, Vec<ClobHistoryPoint>)>>,
     pub strike_inflight: Mutex<HashMap<(String, u32, u32), watch::Sender<bool>>>,
+    /// Fälligkeit der nächsten automatischen Aktualisierung (Unix-Sekunden, 0 = sofort).
+    /// Wanduhr statt Tokio-Timer: Der monotone Takt pausiert im macOS-Ruhezustand.
+    pub next_auto_refresh_ts: AtomicI64,
+    /// Für Busy-Events an das Frontend; wird im Tauri-Setup gesetzt.
+    pub app_handle: OnceLock<AppHandle>,
 }
 
 impl AppState {
@@ -46,30 +68,65 @@ impl AppState {
             backfill_lock: Mutex::new(()),
             strike_cache: Mutex::new(HashMap::new()),
             strike_inflight: Mutex::new(HashMap::new()),
+            next_auto_refresh_ts: AtomicI64::new(0),
+            app_handle: OnceLock::new(),
         })
     }
 
+    fn next_refresh_at(&self) -> Option<String> {
+        match self.next_auto_refresh_ts.load(Ordering::Relaxed) {
+            0 => None,
+            ts => unix_to_rfc3339(ts),
+        }
+    }
+
+    fn schedule_next_refresh_from(&self, from_unix: i64) {
+        self.next_auto_refresh_ts
+            .store(from_unix + (AUTO_REFRESH_MIN * 60) as i64, Ordering::Relaxed);
+    }
+
+    fn build_state(&self, refreshing: bool, backfilling: bool) -> Result<DashboardState, String> {
+        let mut s = self
+            .store
+            .get_dashboard_state(refreshing, backfilling, AUTO_REFRESH_MIN)?;
+        s.next_refresh_at = self.next_refresh_at();
+        Ok(s)
+    }
+
     fn current_state(&self) -> Result<DashboardState, String> {
-        self.store.get_dashboard_state(
+        self.build_state(
             self.refreshing.load(Ordering::Relaxed),
             self.backfilling.load(Ordering::Relaxed),
-            AUTO_REFRESH_MIN,
         )
+    }
+
+    /// Meldet dem Frontend sofort, dass ein Abruf/Backfill startet oder endet,
+    /// damit Buttons gesperrt werden statt "läuft bereits"-Fehler zu erzeugen.
+    fn emit_busy(&self) {
+        if let Some(handle) = self.app_handle.get() {
+            let _ = handle.emit(
+                "compute:busy",
+                BusyState {
+                    refreshing: self.refreshing.load(Ordering::Relaxed),
+                    backfilling: self.backfilling.load(Ordering::Relaxed),
+                    next_refresh_at: self.next_refresh_at(),
+                },
+            );
+        }
     }
 
     async fn run_refresh(&self) -> Result<RefreshSummary, String> {
         let Ok(_guard) = self.refresh_lock.try_lock() else {
             return Err("Aktualisierung läuft bereits.".into());
         };
+        // Jeder Abruf (auch manuell) verschiebt den nächsten automatischen um ein volles Intervall
+        self.schedule_next_refresh_from(chrono::Utc::now().timestamp());
         self.refreshing.store(true, Ordering::Relaxed);
+        self.emit_busy();
         let res = async {
             let bundle = collect_full_market_bundle(&self.client).await;
             let (saved_curves, saved_daily) = self.store.save_bundle(&bundle)?;
-            let state = self.store.get_dashboard_state(
-                false,
-                self.backfilling.load(Ordering::Relaxed),
-                AUTO_REFRESH_MIN,
-            )?;
+            let state = self.build_state(false, self.backfilling.load(Ordering::Relaxed))?;
             Ok(RefreshSummary {
                 ok: true,
                 captured_at: bundle.captured_at,
@@ -81,6 +138,7 @@ impl AppState {
         }
         .await;
         self.refreshing.store(false, Ordering::Relaxed);
+        self.emit_busy();
         res
     }
 
@@ -89,6 +147,7 @@ impl AppState {
             return Err("Historien-Backfill läuft bereits.".into());
         };
         self.backfilling.store(true, Ordering::Relaxed);
+        self.emit_busy();
         let res = async {
             let mut cur = self.current_state()?;
             if !cur.has_data {
@@ -103,11 +162,7 @@ impl AppState {
             let (days_out, strikes_fetched, errors) =
                 reconstruct_daily_backfill(&self.client, &cur.gpus, clamped_days).await;
             let saved_days = self.store.save_backfill_days(&days_out)?;
-            let state = self.store.get_dashboard_state(
-                self.refreshing.load(Ordering::Relaxed),
-                false,
-                AUTO_REFRESH_MIN,
-            )?;
+            let state = self.build_state(self.refreshing.load(Ordering::Relaxed), false)?;
             Ok(BackfillSummary {
                 ok: true,
                 saved_days,
@@ -119,6 +174,7 @@ impl AppState {
         }
         .await;
         self.backfilling.store(false, Ordering::Relaxed);
+        self.emit_busy();
         res
     }
 }
@@ -261,12 +317,29 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
             let state = Arc::clone(&bg_state);
+            let _ = state.app_handle.set(handle.clone());
             tauri::async_runtime::spawn(async move {
                 let initial = state.current_state().ok();
+                // Fälligkeit aus dem letzten Datenstand ableiten (ein Start-Abruf setzt sie neu)
+                if let Some(last) = initial
+                    .as_ref()
+                    .and_then(|s| s.last_captured_at.as_deref())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                {
+                    state.schedule_next_refresh_from(last.timestamp());
+                }
                 // Prüft explizit Kurvenabdeckung pro GPU (nicht nur Spot-Daten nach Legacy-Import)
+                // und den Datenstand: nach Tagen ohne App sofort frisch laden statt 15 Min. Altdaten.
                 let need_live = initial
                     .as_ref()
-                    .map(|s| !s.has_data || s.gpus.values().any(|g| g.expiries.is_empty()))
+                    .map(|s| {
+                        !s.has_data
+                            || s.gpus.values().any(|g| g.expiries.is_empty())
+                            || is_older_than(
+                                s.last_captured_at.as_deref(),
+                                chrono::Duration::minutes(AUTO_REFRESH_MIN as i64),
+                            )
+                    })
                     .unwrap_or(true);
 
                 if need_live {
@@ -275,15 +348,17 @@ pub fn run() {
                     }
                 }
 
+                // Nicht mehr "solange eine GPU 0 Backfill-Tage hat": Für junge Märkte (z. B. H200
+                // ohne CLOB-Vortage) lief so bei jedem Start ein voller Backfill mit Hunderten Abrufen.
                 let after_live = state.current_state().ok();
                 let need_backfill = after_live
                     .as_ref()
                     .map(|s| {
                         s.has_data
-                            && (s.last_backfill_at.is_none()
-                                || s.gpus
-                                    .values()
-                                    .any(|g| !g.expiries.is_empty() && g.backfill_snapshot_count == 0))
+                            && is_older_than(
+                                s.last_backfill_at.as_deref(),
+                                chrono::Duration::hours(AUTO_BACKFILL_MIN_AGE_HOURS),
+                            )
                     })
                     .unwrap_or(false);
 
@@ -293,10 +368,14 @@ pub fn run() {
                     }
                 }
 
-                let mut ticker = tokio::time::interval(Duration::from_secs(AUTO_REFRESH_MIN * 60));
-                ticker.tick().await;
+                // Fälligkeit gegen die Wanduhr prüfen: Manuelle Abrufe verschieben den Termin,
+                // und nach dem Aufwachen aus dem Ruhezustand wird binnen 30 s aktualisiert.
                 loop {
-                    ticker.tick().await;
+                    tokio::time::sleep(Duration::from_secs(SCHEDULER_TICK_SECS)).await;
+                    let due = state.next_auto_refresh_ts.load(Ordering::Relaxed);
+                    if chrono::Utc::now().timestamp() < due {
+                        continue;
+                    }
                     if let Ok(summary) = state.run_refresh().await {
                         let _ = handle.emit("compute:updated", &summary.state);
                     }
@@ -314,4 +393,19 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("Fehler beim Starten von Konvex Compute");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staleness_check_handles_missing_and_old_timestamps() {
+        let fifteen = chrono::Duration::minutes(15);
+        assert!(is_older_than(None, fifteen));
+        assert!(is_older_than(Some("kein Datum"), fifteen));
+        assert!(is_older_than(Some("2020-01-01T00:00:00Z"), fifteen));
+        let fresh = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(!is_older_than(Some(&fresh), fifteen));
+    }
 }

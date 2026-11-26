@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS meta_kv (
 );
 "#;
 
+/// Live-Snapshots bleiben so lange vollständig erhalten (alle 15 Min.), danach nur der letzte je Tag.
+const LIVE_KEEP_ALL_HOURS: i64 = 48;
+
 pub struct ComputeStore {
     pub db_path: PathBuf,
 }
@@ -218,9 +221,41 @@ impl ComputeStore {
         )
         .map_err(|e| format!("meta_kv last_errors Fehler: {e}"))?;
 
+        // Ohne Ausdünnen wächst die DB um ~28 MB pro Tag (4 GPUs x 96 Stände x ~75 KB).
+        let reference = chrono::DateTime::parse_from_rfc3339(captured_at)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let cutoff = (reference - Duration::hours(LIVE_KEEP_ALL_HOURS))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        Self::prune_live_snapshots(&tx, &cutoff)?;
+
         tx.commit()
             .map_err(|e| format!("SQLite Commit fehlgeschlagen: {e}"))?;
         Ok((saved_curves, saved_daily))
+    }
+
+    /// Dünnt Live-Snapshots, die vor `cutoff` erfasst wurden, auf den letzten Stand je GPU
+    /// und Kalendertag aus. Genau diesen Stand nutzen Tagesvergleiche und Snapshot-Auswahl,
+    /// sichtbar geht also nichts verloren. Backfill-Tage bleiben unberührt.
+    fn prune_live_snapshots(conn: &Connection, cutoff: &str) -> Result<usize, String> {
+        conn.execute(
+            "DELETE FROM curve_snapshots
+             WHERE snapshot_kind = 'live'
+               AND captured_at < ?1
+               AND id NOT IN (
+                   SELECT id FROM (
+                       SELECT id, ROW_NUMBER() OVER (
+                           PARTITION BY gpu, snapshot_date
+                           ORDER BY captured_at DESC, id DESC
+                       ) AS rn
+                       FROM curve_snapshots
+                       WHERE snapshot_kind = 'live'
+                   )
+                   WHERE rn = 1
+               )",
+            params![cutoff],
+        )
+        .map_err(|e| format!("Ausdünnen alter Live-Snapshots fehlgeschlagen: {e}"))
     }
 
     /// Speichert Backfill-Tage mit BEGIN IMMEDIATE und erhält bestehende Verfälle bei Teilabrufen.
@@ -387,9 +422,11 @@ impl ComputeStore {
             .format("%Y-%m-%d")
             .to_string();
 
+        // Bewusst ohne expiries_json: bei 15-Minuten-Snapshots liegen schnell Hunderte
+        // Kandidaten im Fenster, das JSON wird nur für den Gewinner geladen.
         let mut stmt = conn
             .prepare(
-                "SELECT id, captured_at, snapshot_date, snapshot_kind, spot_price, expiries_json
+                "SELECT id, snapshot_date, snapshot_kind
                  FROM curve_snapshots
                  WHERE gpu = ?1 AND snapshot_date >= ?2 AND snapshot_date <= ?3
                  ORDER BY snapshot_date DESC, CASE WHEN snapshot_kind = 'live' THEN 0 ELSE 1 END ASC, id DESC",
@@ -402,34 +439,47 @@ impl ComputeStore {
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<f64>>(4)?,
-                    r.get::<_, String>(5)?,
                 ))
             })
             .ok()?;
 
         let target_date = latest_date - Duration::days(target_days);
-        let mut best: Option<(i64, i64, i64, String, String, String, Option<f64>, String)> = None;
+        // (Distanz zum Zieltag, Live-Vorrang, Snapshot-ID)
+        let mut best: Option<(i64, i64, i64)> = None;
 
-        for row in rows.flatten() {
-            if Some(row.0) == latest_id {
+        for (id, snapshot_date, snapshot_kind) in rows.flatten() {
+            if Some(id) == latest_id {
                 continue;
             }
-            let Ok(d) = NaiveDate::parse_from_str(&row.2, "%Y-%m-%d") else {
+            let Ok(d) = NaiveDate::parse_from_str(&snapshot_date, "%Y-%m-%d") else {
                 continue;
             };
             let dist = (d - target_date).num_days().abs();
-            let kind_penalty = if row.3 == "live" { 0 } else { 1 };
+            let kind_penalty = if snapshot_kind == "live" { 0 } else { 1 };
             match &best {
                 Some(prev) if (prev.0, prev.1) <= (dist, kind_penalty) => {}
-                _ => {
-                    best = Some((dist, kind_penalty, row.0, row.1, row.2, row.3, row.4, row.5));
-                }
+                _ => best = Some((dist, kind_penalty, id)),
             }
         }
 
-        let (_, _, id, captured_at, snapshot_date, snapshot_kind, spot_price, json_str) = best?;
+        let (_, _, best_id) = best?;
+        let (id, captured_at, snapshot_date, snapshot_kind, spot_price, json_str) = conn
+            .query_row(
+                "SELECT id, captured_at, snapshot_date, snapshot_kind, spot_price, expiries_json
+                 FROM curve_snapshots WHERE id = ?1",
+                params![best_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<f64>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .ok()?;
         let d = NaiveDate::parse_from_str(&snapshot_date, "%Y-%m-%d").ok()?;
         let days_ago = (latest_date - d).num_days();
         let expiries: Vec<ExpiryCurvePoint> = serde_json::from_str(&json_str).unwrap_or_default();
@@ -838,6 +888,7 @@ impl ComputeStore {
             refreshing,
             backfilling,
             interval_min,
+            next_refresh_at: None,
             gpu_order,
             gpus: gpus_out,
             extra_spots,
@@ -1139,6 +1190,90 @@ mod tests {
         // 30T-Änderung ist None (keine 30 Tage Historie vorhanden, kein falscher Fallback)
         assert_eq!(h100.change_30d_pct, None);
 
+        let _ = fs::remove_file(&tmp);
+    }
+
+    fn live_bundle(captured_at: &str, med: f64) -> FetchedMarketBundle {
+        let mut gpus = BTreeMap::new();
+        gpus.insert(
+            "H100".into(),
+            FetchedGpuBundle {
+                meta: gpu_catalog().into_iter().next().unwrap(),
+                spot: None,
+                reference_spot_price: Some(3.0),
+                ornn_history: Vec::new(),
+                expiries: vec![make_exp("h100-june-2027", med, 10)],
+                total_liquidity: 1.0,
+                total_volume_24h: 1.0,
+                total_volume_total: 1.0,
+            },
+        );
+        FetchedMarketBundle {
+            captured_at: captured_at.into(),
+            errors: Vec::new(),
+            gpus,
+            extra_spots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn old_live_snapshots_are_thinned_to_last_of_day() {
+        let tmp = std::env::temp_dir().join(format!(
+            "konvex-compute-test-prune-{}.db",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&tmp);
+        let store = ComputeStore::open(tmp.clone()).unwrap();
+
+        // Alter Tag mit drei Ständen, jüngerer Tag (innerhalb 48h) mit zwei Ständen
+        for (ts, med) in [
+            ("2026-11-20T08:00:00Z", 2.60),
+            ("2026-11-20T12:00:00Z", 2.61),
+            ("2026-11-20T23:45:00Z", 2.62),
+            ("2026-11-25T09:00:00Z", 2.70),
+            ("2026-11-25T09:15:00Z", 2.71),
+        ] {
+            store.save_bundle(&live_bundle(ts, med)).unwrap();
+        }
+        // Ein Backfill-Tag darf vom Ausdünnen nie betroffen sein
+        store
+            .save_backfill_days(&[BackfillCurveDay {
+                gpu: "H100".into(),
+                snapshot_date: "2026-11-19".into(),
+                captured_at: "2026-11-19T23:59:59Z".into(),
+                spot_price: Some(2.9),
+                expiries: vec![make_exp("h100-june-2027", 2.55, 10)],
+            }])
+            .unwrap();
+        // Auslöser: Abruf am 26.11. -> Grenze 24.11. 12:00
+        store.save_bundle(&live_bundle("2026-11-26T12:00:00Z", 2.80)).unwrap();
+
+        let conn = store.connect().unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT captured_at, snapshot_kind FROM curve_snapshots ORDER BY captured_at")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        let stamps: Vec<&str> = rows.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            stamps,
+            vec![
+                "2026-11-19T23:59:59Z",
+                "2026-11-20T23:45:00Z",
+                "2026-11-25T09:00:00Z",
+                "2026-11-25T09:15:00Z",
+                "2026-11-26T12:00:00Z",
+            ]
+        );
+
+        // Der behaltene Tagesstand ist genau der, den der Vergleich ohnehin gewählt hätte
+        let state = store.get_dashboard_state(false, false, 15).unwrap();
+        let h100 = state.gpus.get("H100").unwrap();
+        assert_eq!(h100.compare_1d.as_ref().unwrap().captured_at.as_deref(), Some("2026-11-25T09:15:00Z"));
+
+        drop(conn);
         let _ = fs::remove_file(&tmp);
     }
 }

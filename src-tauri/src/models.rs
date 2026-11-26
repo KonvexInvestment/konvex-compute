@@ -207,10 +207,21 @@ pub struct DashboardState {
     pub refreshing: bool,
     pub backfilling: bool,
     pub interval_min: u64,
+    /// Geplanter Zeitpunkt der nächsten automatischen Aktualisierung (RFC3339, UTC).
+    #[serde(default)]
+    pub next_refresh_at: Option<String>,
     pub gpu_order: Vec<String>,
     pub gpus: BTreeMap<String, GpuDashboard>,
     pub extra_spots: Vec<ExtraSpot>,
     pub db_stats: DbStats,
+}
+
+/// Leichtgewichtiges Event-Payload, sobald ein Abruf oder Backfill startet bzw. endet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusyState {
+    pub refreshing: bool,
+    pub backfilling: bool,
+    pub next_refresh_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
