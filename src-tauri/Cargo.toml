@@ -1,0 +1,43 @@
+[package]
+name = "konvex-compute"
+version = "1.0.0"
+description = "Konvex Compute: Privater GPU-Forward-Curve-Tracker (Polymarket + Ornn)"
+authors = ["Bennett Heitjan"]
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "konvex_compute_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "konvex-compute"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = "s"
+
+[profile.release.build-override]
+strip = false

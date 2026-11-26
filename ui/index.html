@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="de" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Konvex Compute</title>
+  <link rel="stylesheet" href="./app.css">
+</head>
+<body>
+  <div class="app-frame">
+    <!-- Konvex-Analytics-Kopfzeile -->
+    <header class="ka-topbar">
+      <div class="ka-brand">
+        <span class="ka-brand-badge" aria-hidden="true">K</span>
+        <div class="ka-brand-copy">
+          <span class="ka-brand-name">Konvex Compute</span>
+          <span class="ka-brand-tag">GPU Forward Curve</span>
+        </div>
+      </div>
+
+      <nav class="ka-nav scroller" role="tablist" focusgroup="tablist nomemory" aria-label="Ansichten" id="view-tablist">
+        <button type="button" role="tab" id="vtab-curve" data-view="curve" aria-selected="true" focusgroupstart class="ka-nav-tab">Forward-Kurve</button>
+        <button type="button" role="tab" id="vtab-compare" data-view="compare" aria-selected="false" class="ka-nav-tab">Tages- &amp; Wochenvergleich</button>
+        <button type="button" role="tab" id="vtab-matrix" data-view="matrix" aria-selected="false" class="ka-nav-tab">Alle GPUs</button>
+        <button type="button" role="tab" id="vtab-store" data-view="store" aria-selected="false" class="ka-nav-tab">Data Store</button>
+      </nav>
+
+      <div class="ka-topbar-right">
+        <span class="freshness-badge" id="freshness-badge" title="Letzter Datenabruf">
+          <span class="freshness-dot" id="freshness-dot"></span>
+          <span id="freshness-text">Lade Daten...</span>
+        </span>
+        <button type="button" class="ka-btn ka-btn-ghost" id="theme-toggle" aria-label="Farbschema wechseln">Hell</button>
+        <button type="button" class="ka-btn ka-btn-primary" id="refresh-btn">
+          <span class="ka-spinner" aria-hidden="true"></span>
+          <span class="ka-btn-label">Aktualisieren</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="ka-alert" id="error-banner" hidden role="alert"></div>
+
+    <main class="ka-main">
+      <!-- Gemeinsame GPU-Auswahlleiste für Kurve & Vergleich -->
+      <section class="ka-gpu-bar" id="gpu-bar" aria-label="GPU-Auswahl">
+        <div class="gpu-tablist scroller" id="gpu-tablist" role="tablist" focusgroup="tablist nomemory" aria-label="GPU-Modelle">
+          <button type="button" role="tab" id="tab-H100" data-gpu="H100" aria-selected="true" focusgroupstart class="gpu-tab" style="--gpu-color:#38b6ff">
+            <span class="gpu-tab-top"><span class="gpu-dot"></span><span class="gpu-name">H100</span><span class="gpu-sub-tag">SXM</span></span>
+            <span class="gpu-tab-bottom"><span class="gpu-price">...</span><span class="gpu-delta"></span></span>
+          </button>
+          <button type="button" role="tab" id="tab-H200" data-gpu="H200" aria-selected="false" class="gpu-tab" style="--gpu-color:#a78bfa">
+            <span class="gpu-tab-top"><span class="gpu-dot"></span><span class="gpu-name">H200</span><span class="gpu-sub-tag">Hopper</span></span>
+            <span class="gpu-tab-bottom"><span class="gpu-price">...</span><span class="gpu-delta"></span></span>
+          </button>
+          <button type="button" role="tab" id="tab-B200" data-gpu="B200" aria-selected="false" class="gpu-tab" style="--gpu-color:#f59e0b">
+            <span class="gpu-tab-top"><span class="gpu-dot"></span><span class="gpu-name">B200</span><span class="gpu-sub-tag">Blackwell</span></span>
+            <span class="gpu-tab-bottom"><span class="gpu-price">...</span><span class="gpu-delta"></span></span>
+          </button>
+          <button type="button" role="tab" id="tab-B300" data-gpu="B300" aria-selected="false" class="gpu-tab" style="--gpu-color:#30d158">
+            <span class="gpu-tab-top"><span class="gpu-dot"></span><span class="gpu-name">B300</span><span class="gpu-sub-tag">Blackwell Ultra</span></span>
+            <span class="gpu-tab-bottom"><span class="gpu-price">...</span><span class="gpu-delta"></span></span>
+          </button>
+        </div>
+      </section>
+
+      <!-- ANSICHT 1: Forward-Kurve -->
+      <div role="tabpanel" id="panel-curve" aria-labelledby="vtab-curve" class="view-panel">
+        <div class="panel-inner">
+          <!-- Hero-KPI-Grid -->
+          <section class="kpi-grid">
+            <article class="ka-card kpi-hero">
+              <div class="kpi-kicker" id="hero-kicker">Ornn Compute Price Index · H100 SXM</div>
+              <div class="kpi-hero-row">
+                <span class="kpi-hero-val mono" id="hero-price">...</span>
+                <span class="kpi-hero-unit">/ GPU-Std.</span>
+              </div>
+              <div class="kpi-hero-changes mono" id="hero-changes"></div>
+            </article>
+
+            <article class="ka-card kpi-tile">
+              <div class="kpi-label" id="kpi-front-label">Front-Monat</div>
+              <div class="kpi-val mono" id="kpi-front-val">...</div>
+              <div class="kpi-sub mono" id="kpi-front-sub"></div>
+            </article>
+
+            <article class="ka-card kpi-tile">
+              <div class="kpi-label" id="kpi-mid-label">Mittelstrecke</div>
+              <div class="kpi-val mono" id="kpi-mid-val">...</div>
+              <div class="kpi-sub mono" id="kpi-mid-sub"></div>
+            </article>
+
+            <article class="ka-card kpi-tile">
+              <div class="kpi-label" id="kpi-back-label">Langfrist-Ende</div>
+              <div class="kpi-val mono" id="kpi-back-val">...</div>
+              <div class="kpi-sub mono" id="kpi-back-sub"></div>
+            </article>
+
+            <article class="ka-card kpi-tile">
+              <div class="kpi-label">Markttiefe (Polymarket)</div>
+              <div class="kpi-val mono" id="kpi-liq-val">...</div>
+              <div class="kpi-sub mono" id="kpi-liq-sub"></div>
+            </article>
+          </section>
+
+          <!-- Haupt-Chart -->
+          <section class="ka-card chart-panel">
+            <div class="chart-toolbar">
+              <div class="toolbar-cluster">
+                <span class="toolbar-label">Historie</span>
+                <div class="seg-group" role="group" aria-label="Historienzeitraum">
+                  <button type="button" class="seg-btn" data-hist="30">1M</button>
+                  <button type="button" class="seg-btn is-active" data-hist="90">3M</button>
+                  <button type="button" class="seg-btn" data-hist="all">Alle</button>
+                </div>
+
+                <span class="toolbar-sep" aria-hidden="true"></span>
+
+                <span class="toolbar-label">Kurvenvergleich</span>
+                <div class="seg-group" role="group" aria-label="Kurvenvergleich">
+                  <button type="button" class="seg-btn is-active" data-cmp="none">Aus</button>
+                  <button type="button" class="seg-btn" data-cmp="1d" id="cmp-btn-1d">1T</button>
+                  <button type="button" class="seg-btn" data-cmp="7d" id="cmp-btn-7d">1W</button>
+                  <button type="button" class="seg-btn" data-cmp="30d" id="cmp-btn-30d">1M</button>
+                </div>
+                <select id="compare-select" class="ka-select" aria-label="Beliebiger Snapshot zum Vergleich">
+                  <option value="">Snapshot wählen...</option>
+                </select>
+              </div>
+
+              <div class="toolbar-cluster">
+                <label class="ka-check">
+                  <input type="checkbox" id="opt-iqr" checked>
+                  <span>P25 bis P75</span>
+                </label>
+                <label class="ka-check">
+                  <input type="checkbox" id="opt-outer">
+                  <span>P10 bis P90</span>
+                </label>
+                <label class="ka-check" title="Bedingter Erwartungswert über den Kernbereich P5 bis P95 ohne 2-Jahres-Zinsboden-Verzerrung">
+                  <input type="checkbox" id="opt-mean-trimmed">
+                  <span>Kern-Mean</span>
+                </label>
+                <label class="ka-check" title="Voller Integral-Erwartungswert inkl. oberem Tail (steigt bei langen Laufzeiten durch Rechtsschiefe und Kapitalbindungs-Boden)">
+                  <input type="checkbox" id="opt-mean-raw">
+                  <span>Roh-Mean</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="chart-stage" id="forward-chart-stage">
+              <svg id="forward-chart-svg" class="chart-svg" role="img" aria-label="Historischer GPU-Spotpreis und Polymarket-Forward-Kurve"></svg>
+              <div class="ka-tooltip" id="chart-tooltip" hidden></div>
+            </div>
+
+            <div class="expiry-strip scroller" id="expiry-strip" aria-label="Verfallsmonate"></div>
+          </section>
+
+          <!-- Detail-Grid für gewählten Verfall -->
+          <section class="detail-grid">
+            <article class="ka-card panel-pad">
+              <div class="section-head">
+                <div>
+                  <h2 class="section-title" id="dist-title">Implizite Verteilung</h2>
+                  <p class="section-sub" id="dist-sub">Klicke auf einen Verfall im Chart oder in der Leiste.</p>
+                </div>
+                <span class="ka-badge mono" id="dist-skew-badge">Skew</span>
+              </div>
+
+              <div class="mini-grid" id="dist-metrics"></div>
+              <p class="skew-note" id="skew-note" hidden></p>
+
+              <div class="dist-stage" id="dist-chart-stage">
+                <svg id="dist-chart-svg" class="chart-svg" role="img" aria-label="Implizite Preisverteilung des gewählten Verfalls"></svg>
+                <div class="ka-tooltip" id="dist-tooltip" hidden></div>
+              </div>
+            </article>
+
+            <article class="ka-card panel-pad">
+              <div class="section-head">
+                <div>
+                  <h2 class="section-title" id="strikes-caption">Strike-Leiter</h2>
+                  <p class="section-sub">Klick auf eine Zeile lädt den 30-Tage-Wahrscheinlichkeitsverlauf aus der CLOB-API.</p>
+                </div>
+                <span class="ka-badge mono" id="strikes-quality-pill">PAVA</span>
+              </div>
+
+              <div tabindex="0" role="region" aria-labelledby="strikes-caption" class="table-wrapper strikes-wrap">
+                <table class="ka-table strikes-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Strike</th>
+                      <th scope="col" class="num">P(Ja)</th>
+                      <th scope="col" class="num">PAVA</th>
+                      <th scope="col" class="num">Bid / Ask</th>
+                      <th scope="col" class="num">Spread</th>
+                      <th scope="col" class="num">24h Δ</th>
+                      <th scope="col" class="num">Liquidität</th>
+                      <th scope="col" class="num">Vol. 24h</th>
+                    </tr>
+                  </thead>
+                  <tbody id="strikes-tbody"></tbody>
+                </table>
+              </div>
+
+              <div class="strike-history-panel" id="strike-history-box" hidden>
+                <div class="strike-history-head">
+                  <div>
+                    <div class="strike-history-title" id="strike-history-title">Strike-Verlauf</div>
+                    <div class="strike-history-sub mono" id="strike-history-sub"></div>
+                  </div>
+                  <button type="button" class="ka-btn ka-btn-ghost ka-btn-xs" id="close-strike-history">Schließen</button>
+                </div>
+                <div class="strike-history-stage">
+                  <svg id="strike-history-svg" class="chart-svg" role="img" aria-label="Historischer Verlauf der Strike-Wahrscheinlichkeit"></svg>
+                </div>
+              </div>
+            </article>
+          </section>
+        </div>
+      </div>
+
+      <!-- ANSICHT 2: Tages- & Wochenvergleich -->
+      <div role="tabpanel" id="panel-compare" aria-labelledby="vtab-compare" class="view-panel" hidden>
+        <div class="panel-inner">
+          <section class="compare-kpi-grid" id="compare-kpi-grid"></section>
+
+          <section class="ka-card panel-pad">
+            <div class="section-head">
+              <div>
+                <h2 class="section-title" id="shift-chart-title">Kurvenverschiebung nach Laufzeit (Δ 1T vs. Δ 1W)</h2>
+                <p class="section-sub" id="shift-chart-sub">Zeigt auf einen Blick, ob sich die Forward-Kurve parallel verschoben, versteilt oder abgeflacht hat.</p>
+              </div>
+              <button type="button" class="ka-btn ka-btn-ghost ka-btn-xs" id="run-backfill-quick">14T-Backfill aktualisieren</button>
+            </div>
+            <div class="shift-stage" id="shift-chart-stage">
+              <svg id="shift-chart-svg" class="chart-svg" role="img" aria-label="Veränderung der Forward-Kurve nach Laufzeit im Tages- und Wochenvergleich"></svg>
+              <div class="ka-tooltip" id="shift-tooltip" hidden></div>
+            </div>
+          </section>
+
+          <section class="ka-card panel-pad">
+            <div class="section-head">
+              <div>
+                <h2 class="section-title" id="compare-table-caption">Verfalls-Vergleichstabelle</h2>
+                <p class="section-sub" id="compare-table-sub"></p>
+              </div>
+            </div>
+
+            <div tabindex="0" role="region" aria-labelledby="compare-table-caption" class="table-wrapper">
+              <table class="ka-table compare-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Verfall</th>
+                    <th scope="col" class="num">Aktuell (P50)</th>
+                    <th scope="col" class="num">Gestern (1T)</th>
+                    <th scope="col" class="num">Δ 1T ($)</th>
+                    <th scope="col" class="num">Δ 1T (%)</th>
+                    <th scope="col" class="num">Vor 7T (1W)</th>
+                    <th scope="col" class="num">Δ 7T ($)</th>
+                    <th scope="col" class="num">Δ 7T (%)</th>
+                    <th scope="col" class="num">Kern-Mean</th>
+                    <th scope="col" class="num">Roh-Mean</th>
+                    <th scope="col" class="num">IQR</th>
+                  </tr>
+                </thead>
+                <tbody id="compare-tbody"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <!-- ANSICHT 3: Alle GPUs im Relative-Value-Vergleich -->
+      <div role="tabpanel" id="panel-matrix" aria-labelledby="vtab-matrix" class="view-panel" hidden>
+        <div class="panel-inner">
+          <section class="ka-card panel-pad">
+            <div class="section-head">
+              <div>
+                <h2 class="section-title" id="matrix-caption">Alle GPU-Forward-Kurven im Vergleich</h2>
+                <p class="section-sub">Spot, 1T/7T/30T-Veränderung, Stützstellen bis Dez. 2028, Kurvensteigung und Preisverhältnis zu H100. Klick öffnet die GPU.</p>
+              </div>
+            </div>
+
+            <div tabindex="0" role="region" aria-labelledby="matrix-caption" class="table-wrapper matrix-wrap">
+              <table class="ka-table matrix-table">
+                <thead>
+                  <tr>
+                    <th scope="col">GPU</th>
+                    <th scope="col" class="num">Spot</th>
+                    <th scope="col" class="num">1T</th>
+                    <th scope="col" class="num">7T</th>
+                    <th scope="col" class="num">30T</th>
+                    <th scope="col" class="num">Front</th>
+                    <th scope="col" class="num">Juni 27</th>
+                    <th scope="col" class="num">Dez. 27</th>
+                    <th scope="col" class="num">Dez. 28</th>
+                    <th scope="col" class="num">Slope</th>
+                    <th scope="col" class="num">vs. H100</th>
+                    <th scope="col" class="num">Liquidität</th>
+                  </tr>
+                </thead>
+                <tbody id="matrix-tbody"></tbody>
+              </table>
+            </div>
+
+            <div class="extra-spots-row" id="extra-spots-row" hidden>
+              <span class="extra-spots-label">Weitere Ornn-Spot-Indizes (ohne Polymarket-Forward-Kurve)</span>
+              <div class="extra-spots-pills" id="extra-spots-pills"></div>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <!-- ANSICHT 4: Lokaler SQLite Data Store -->
+      <div role="tabpanel" id="panel-store" aria-labelledby="vtab-store" class="view-panel" hidden>
+        <div class="panel-inner">
+          <section class="store-kpi-grid" id="store-kpi-grid"></section>
+
+          <section class="ka-card panel-pad">
+            <div class="section-head">
+              <div>
+                <h2 class="section-title">Lokale SQLite-Datenbank &amp; Backfill</h2>
+                <p class="section-sub mono" id="store-db-path"></p>
+              </div>
+              <div class="toolbar-cluster">
+                <button type="button" class="ka-btn ka-btn-primary" id="run-backfill-btn">
+                  <span class="ka-spinner" aria-hidden="true"></span>
+                  <span class="ka-btn-label">14-Tage-Backfill aus CLOB laden</span>
+                </button>
+              </div>
+            </div>
+
+            <div tabindex="0" role="region" aria-label="Datenabdeckung je GPU" class="table-wrapper">
+              <table class="ka-table">
+                <thead>
+                  <tr>
+                    <th scope="col">GPU</th>
+                    <th scope="col" class="num">Spot-Tage</th>
+                    <th scope="col" class="num">Live-Snapshots</th>
+                    <th scope="col" class="num">Backfill-Tage</th>
+                    <th scope="col">1T-Vergleich</th>
+                    <th scope="col">1W-Vergleich</th>
+                    <th scope="col" class="num">Export</th>
+                  </tr>
+                </thead>
+                <tbody id="store-tbody"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <div class="ka-toast" id="toast" hidden role="status" aria-live="polite"></div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

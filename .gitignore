@@ -1,0 +1,11 @@
+# Rust Build-Artefakte
+/src-tauri/target/
+
+# Lokale SQLite-Datenbanken und Exporte
+*.db
+*.db-wal
+*.db-shm
+*.csv
+
+# macOS
+.DS_Store
