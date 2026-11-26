@@ -44,6 +44,9 @@ const state = {
   toastTimer: null,
   // Lokal angestoßene Aktionen (bis das Backend-Busy-Event eintrifft)
   pending: { refresh: false, backfill: false },
+  // Letztes compute:busy-Event. Sobald eines da ist, gilt nur noch dieses für den
+  // Busy-Zustand: Statusantworten können älter sein als das letzte Busy-Event.
+  busy: null,
   // Fehler aus einer Nutzeraktion: { title, raws }
   actionError: null,
   // Signatur der zuletzt weggeklickten Abruf-Hinweise
@@ -243,6 +246,8 @@ function renderBanner() {
     ({ title, raws } = state.actionError);
   } else {
     const errs = (state.data && state.data.last_errors) || [];
+    // Weggeklickt gilt nur, bis die Quellen wieder fehlerfrei sind
+    if (!errs.length) state.dismissedFetchSig = "";
     if (errs.length && errs.join("|") !== state.dismissedFetchSig) {
       title = "Letzter Abruf unvollständig. Für diese Quellen wird der zuletzt gespeicherte Stand angezeigt:";
       raws = errs;
@@ -1034,9 +1039,19 @@ function syncControlsFromState() {
   applyViewTabs(state.activeView);
 }
 
+/** Übernimmt einen vollständigen Status, ohne einen neueren Busy-Stand zu überschreiben. */
+function adoptState(data) {
+  if (state.busy) {
+    data.refreshing = state.busy.refreshing;
+    data.backfilling = state.busy.backfilling;
+    data.next_refresh_at = state.busy.next_refresh_at;
+  }
+  state.data = data;
+}
+
 async function loadState() {
   try {
-    state.data = await tauriInvoke("get_dashboard_state");
+    adoptState(await tauriInvoke("get_dashboard_state"));
     renderAll();
   } catch (err) {
     setActionError("Daten konnten nicht geladen werden.", err);
@@ -1052,7 +1067,9 @@ async function triggerRefresh() {
   try {
     const res = await tauriInvoke("refresh_now");
     if (res && res.state) {
-      state.data = res.state;
+      adoptState(res.state);
+      // Manueller Abruf zeigt aktuelle Quellenfehler wieder an, auch wenn sie vorher weggeklickt waren
+      state.dismissedFetchSig = "";
       clearActionError();
       renderAll();
       const issues = res.errors && res.errors.length ? ` ${res.errors.length} Quelle(n) mit Hinweis, siehe oben.` : "";
@@ -1075,7 +1092,7 @@ async function triggerBackfill() {
   try {
     const res = await tauriInvoke("backfill_history", { days: 14 });
     if (res && res.state) {
-      state.data = res.state;
+      adoptState(res.state);
       if (res.errors && res.errors.length) {
         setActionError("Backfill unvollständig: Einige Kursverläufe fehlen, die übrigen Tage wurden gespeichert.", res.errors);
       } else {
@@ -1225,7 +1242,7 @@ function setupEvents() {
   // Hintergrund-Updates aus Rust (Start-Abruf, Backfill, 15-Min-Poller)
   tauriListen("compute:updated", (event) => {
     if (event && event.payload) {
-      state.data = event.payload;
+      adoptState(event.payload);
       renderAll();
     }
   });
@@ -1233,10 +1250,10 @@ function setupEvents() {
   // Start/Ende eines Abrufs oder Backfills: Buttons sperren statt "läuft bereits"-Fehler
   tauriListen("compute:busy", (event) => {
     const p = event && event.payload;
-    if (!p || !state.data) return;
-    state.data.refreshing = !!p.refreshing;
-    state.data.backfilling = !!p.backfilling;
-    state.data.next_refresh_at = p.next_refresh_at || null;
+    if (!p) return;
+    state.busy = { refreshing: !!p.refreshing, backfilling: !!p.backfilling, next_refresh_at: p.next_refresh_at || null };
+    if (!state.data) return;
+    adoptState(state.data);
     renderTopbar();
   });
 }

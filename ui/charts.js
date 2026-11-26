@@ -662,8 +662,29 @@ export function renderDistributionChart({ svg, stage, tooltip, expiry, spotPrice
 
   const pad = { top: 24, right: 16, bottom: 40, left: 16 };
   const plotW = width - pad.left - pad.right;
-  const plotH = height - pad.top - pad.bottom;
   const xScale = (v) => pad.left + ((v - xMin) / xSpan) * plotW;
+
+  // Markierungen: Median und heutiger Spot
+  // (Spot neutral grau gestrichelt wie im Hauptchart, damit er nie mit der GPU-Farbe verschmilzt)
+  const markers = [];
+  if (expiry.median !== null && expiry.median !== undefined) markers.push({ v: expiry.median, label: "Median", stroke: "var(--text-primary)", dash: null });
+  if (spotPrice !== null && spotPrice !== undefined && Number.isFinite(spotPrice)) markers.push({ v: spotPrice, label: "Spot heute", stroke: "var(--text-muted)", dash: "4 3" });
+  markers.sort((a, b) => a.v - b.v);
+  // Beschriftung mittig über der Linie, am Rand in die Fläche geschoben (geschätzte Textbreite)
+  for (const m of markers) {
+    m.x = xScale(m.v);
+    m.text = `${m.label} ${fmtUsd(m.v)}`;
+    m.w = m.text.length * 6.2;
+    m.left = Math.min(Math.max(m.x - m.w / 2, pad.left), pad.left + plotW - m.w);
+  }
+  // Würden sich die Beschriftungen berühren, kommen sie auf zwei Zeilen
+  const twoRows = markers.length === 2 && markers[0].left + markers[0].w + 8 > markers[1].left;
+  markers.forEach((m, i) => { m.y = twoRows ? 11 + i * 12 : 13; });
+  if (twoRows) pad.top = 36;
+  // Linien beginnen unter der letzten Textzeile, kreuzen also keine Beschriftung
+  const markerLineTop = (twoRows ? 23 : 13) + 4;
+
+  const plotH = height - pad.top - pad.bottom;
   const maxDens = Math.max(1e-9, ...shapes.map((sh) => sh.dens));
   const yScale = (d) => pad.top + plotH - (d / maxDens) * plotH;
   const baseY = pad.top + plotH;
@@ -709,30 +730,10 @@ export function renderDistributionChart({ svg, stage, tooltip, expiry, spotPrice
     svg.appendChild(el("text", { x: xx, y: baseY + 15, "text-anchor": "middle", fill: "var(--text-muted)", "font-size": 9.5, "font-family": "var(--font-mono)" }, `${tickFmt.format(t)} $`));
   }
 
-  // Markierungen: Median und heutiger Spot
-  // (Spot neutral grau gestrichelt wie im Hauptchart, damit er nie mit der GPU-Farbe verschmilzt)
-  const markers = [];
-  if (expiry.median !== null && expiry.median !== undefined) markers.push({ v: expiry.median, label: "Median", stroke: "var(--text-primary)", dash: null });
-  if (spotPrice !== null && spotPrice !== undefined) markers.push({ v: spotPrice, label: "Spot heute", stroke: "var(--text-muted)", dash: "4 3" });
-  markers.sort((a, b) => a.v - b.v);
-  const xs = markers.map((m) => xScale(m.v));
-  const close = xs.length === 2 && xs[1] - xs[0] < 120;
-  markers.forEach((m, i) => {
-    const xx = xs[i];
-    svg.appendChild(el("line", { x1: xx, x2: xx, y1: pad.top - 6, y2: baseY, stroke: m.stroke, "stroke-width": 1.3, "stroke-dasharray": m.dash, "stroke-opacity": 0.9 }));
-    // Nahe Markierungen: linke Beschriftung nach links, rechte nach rechts
-    let anchor = "middle";
-    let lx = xx;
-    if (close) {
-      anchor = i === 0 ? "end" : "start";
-      lx = i === 0 ? xx - 3 : xx + 3;
-    }
-    if (anchor === "middle" && xx > pad.left + plotW - 45) anchor = "end";
-    if (anchor === "middle" && xx < pad.left + 45) anchor = "start";
-    if (anchor === "end" && lx < pad.left + 70) { anchor = "start"; lx = Math.max(lx, pad.left); }
-    if (anchor === "start" && lx > pad.left + plotW - 70) { anchor = "end"; lx = Math.min(lx, pad.left + plotW); }
-    svg.appendChild(el("text", { x: lx, y: 13, "text-anchor": anchor, fill: m.stroke, "font-size": 10, "font-weight": 600 }, `${m.label} ${fmtUsd(m.v)}`));
-  });
+  for (const m of markers) {
+    svg.appendChild(el("line", { x1: m.x, x2: m.x, y1: markerLineTop, y2: baseY, stroke: m.stroke, "stroke-width": 1.3, "stroke-dasharray": m.dash, "stroke-opacity": 0.9 }));
+    svg.appendChild(el("text", { x: m.left, y: m.y, "text-anchor": "start", fill: m.stroke, "font-size": 10, "font-weight": 600 }, m.text));
+  }
 
   svg.appendChild(el("text", { x: pad.left, y: height - 5, fill: "var(--text-dimmed)", "font-size": 10.5 },
     `Hervorgehoben: P25 bis P75 (${fmtUsd(expiry.p25)} bis ${fmtUsd(expiry.p75)}) · gestrichelt: Randbereiche`));

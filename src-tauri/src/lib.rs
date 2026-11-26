@@ -34,6 +34,13 @@ fn is_older_than(ts: Option<&str>, max_age: chrono::Duration) -> bool {
     }
 }
 
+/// Totalausfall eines Backfills (z. B. offline nach dem Aufwachen): Dann darf
+/// last_backfill_at nicht fortgeschrieben werden, sonst sperrt die 20-Stunden-Regel
+/// den nächsten automatischen Versuch, obwohl nichts geladen wurde.
+fn backfill_failed_completely(strikes_fetched: usize, errors: &[String]) -> bool {
+    strikes_fetched == 0 && !errors.is_empty()
+}
+
 fn unix_to_rfc3339(ts: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
@@ -53,6 +60,9 @@ pub struct AppState {
     pub next_auto_refresh_ts: AtomicI64,
     /// Für Busy-Events an das Frontend; wird im Tauri-Setup gesetzt.
     pub app_handle: OnceLock<AppHandle>,
+    /// Serialisiert Lesen+Senden der Busy-Flags: Da jede Flag-Änderung ein Event auslöst,
+    /// trägt so das zuletzt gesendete Event immer den aktuellen Stand.
+    busy_emit_lock: std::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -70,6 +80,7 @@ impl AppState {
             strike_inflight: Mutex::new(HashMap::new()),
             next_auto_refresh_ts: AtomicI64::new(0),
             app_handle: OnceLock::new(),
+            busy_emit_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -103,6 +114,7 @@ impl AppState {
     /// Meldet dem Frontend sofort, dass ein Abruf/Backfill startet oder endet,
     /// damit Buttons gesperrt werden statt "läuft bereits"-Fehler zu erzeugen.
     fn emit_busy(&self) {
+        let _serial = self.busy_emit_lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(handle) = self.app_handle.get() {
             let _ = handle.emit(
                 "compute:busy",
@@ -161,6 +173,12 @@ impl AppState {
             let clamped_days = days.clamp(3, 30);
             let (days_out, strikes_fetched, errors) =
                 reconstruct_daily_backfill(&self.client, &cur.gpus, clamped_days).await;
+            if backfill_failed_completely(strikes_fetched, &errors) {
+                return Err(format!(
+                    "Kein Kursverlauf abrufbar, Backfill wird beim nächsten Start erneut versucht. {}",
+                    errors.first().map(String::as_str).unwrap_or("")
+                ));
+            }
             let saved_days = self.store.save_backfill_days(&days_out)?;
             let state = self.build_state(self.refreshing.load(Ordering::Relaxed), false)?;
             Ok(BackfillSummary {
@@ -407,5 +425,17 @@ mod tests {
         assert!(is_older_than(Some("2020-01-01T00:00:00Z"), fifteen));
         let fresh = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         assert!(!is_older_than(Some(&fresh), fifteen));
+    }
+
+    #[test]
+    fn total_backfill_outage_is_not_recorded_as_done() {
+        let err = vec!["Netzwerkfehler bei https://clob.polymarket.com/prices-history".to_string()];
+        // Offline: nichts geladen, Fehler vorhanden -> Fehler, Zeitstempel bleibt
+        assert!(backfill_failed_completely(0, &err));
+        // Teilausfall: Rest wird gespeichert
+        assert!(!backfill_failed_completely(12, &err));
+        // Junger Markt ohne Vortage bzw. ohne Token: kein Fehler, gilt als erledigt
+        assert!(!backfill_failed_completely(0, &[]));
+        assert!(!backfill_failed_completely(40, &[]));
     }
 }

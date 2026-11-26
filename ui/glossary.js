@@ -104,7 +104,7 @@ export function installTermTooltips() {
 function describeSource(raw) {
   if (/gamma-api\.polymarket|Polymarket Gamma/i.test(raw)) return "Polymarket-Kurven";
   if (/clob\.polymarket|CLOB/i.test(raw)) return "Polymarket-Kursverlauf";
-  const url = raw.match(/api\.ornnai\.com\/api\/gpu\/([^/?\s]+)(\/index-history)?/);
+  const url = raw.match(/api\.ornnai\.com\/api\/gpu\/([^/?\s:]+)(\/index-history)?/);
   if (url) {
     let name = url[1];
     try { name = decodeURIComponent(name); } catch { /* Rohname behalten */ }
