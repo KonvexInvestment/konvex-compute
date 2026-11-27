@@ -6,7 +6,8 @@
 //!   halbjährlicher Kupon, Valuta einen Geschäftstag später).
 //! - G-Spread gegen die lineare Treasury-Kurve (Par-Kurve von Treasury.gov,
 //!   konstante Laufzeiten).
-//! - Auswahl repräsentativer Anleihen je Emittent und Tagesspread als Median.
+//! - Auswahl repräsentativer Anleihen je Emittent, Tagesniveau als Mittelwert und
+//!   verkettete Veränderungsreihe, beide stichtagsgetreu.
 
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,9 @@ pub const SELECT_MAX_YEARS: f64 = 12.0;
 pub const SELECT_TARGET_YEARS: f64 = 5.0;
 /// Bestehende Auswahl bleibt, solange jede Anleihe noch so lange läuft.
 pub const KEEP_MIN_YEARS: f64 = 1.5;
+/// Fehlt einer Anleihe ein Kurstag, gilt ihr letzter Spread so viele Kalendertage weiter
+/// (Wochenende plus Feiertag), damit Lücken keine Sprünge im Tagesmittel erzeugen.
+pub const SPREAD_CARRY_DAYS: i64 = 4;
 pub const BONDS_PER_ISSUER: usize = 3;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,10 +146,20 @@ fn coupon_schedule(settle: NaiveDate, maturity: NaiveDate) -> Option<(NaiveDate,
     }
 }
 
+/// Anteil der laufenden Kuponperiode, der bis zur Valuta verstrichen ist (30/360).
+/// Stückzinsen und Abzinsung nutzen denselben Anteil; 30/360 ist über einen 31. als
+/// Zwischentermin nicht additiv, getrennte Zählungen wichen sonst um einen Tag ab.
+fn elapsed_fraction(settle: NaiveDate, prev: NaiveDate, next: NaiveDate) -> f64 {
+    let period = days_30_360(prev, next).max(1);
+    // Mindestens ein Tag Rest: Sonst wäre der letzte Kupon unabhängig von der Rendite
+    let elapsed = days_30_360(prev, settle).clamp(0, period - 1);
+    elapsed as f64 / period as f64
+}
+
 /// Dirty-Kurs je 100 Nominal zur Rendite `y` (Dezimal, halbjährlich verzinst).
 fn dirty_price(y: f64, coupon_pct: f64, settle: NaiveDate, prev: NaiveDate, future: &[NaiveDate]) -> f64 {
     let c = coupon_pct / 2.0;
-    let w = days_30_360(settle, future[0]) as f64 / days_30_360(prev, future[0]).max(1) as f64;
+    let w = 1.0 - elapsed_fraction(settle, prev, future[0]);
     let v = 1.0 / (1.0 + y / 2.0);
     let n = future.len();
     let mut pv = 0.0;
@@ -159,8 +173,7 @@ fn dirty_price(y: f64, coupon_pct: f64, settle: NaiveDate, prev: NaiveDate, futu
 /// Stückzinsen je 100 Nominal.
 pub fn accrued_interest(coupon_pct: f64, settle: NaiveDate, maturity: NaiveDate) -> Option<f64> {
     let (prev, future) = coupon_schedule(settle, maturity)?;
-    let period = days_30_360(prev, future[0]).max(1) as f64;
-    Some(coupon_pct / 2.0 * days_30_360(prev, settle) as f64 / period)
+    Some(coupon_pct / 2.0 * elapsed_fraction(settle, prev, future[0]))
 }
 
 /// Rendite in Prozent aus dem Clean-Kurs (je 100 Nominal), per Bisektion.
@@ -325,46 +338,66 @@ pub fn bond_spread_series(
         .collect()
 }
 
-/// Verkettete Emittentenreihe: Am letzten Tag gilt der Mittelwert aller Anleihen, rückwärts
-/// zählen nur die Veränderungen der Anleihen, die an beiden Tagen notieren. Kommt eine
-/// Anleihe neu in den Korb oder fehlt sie an einem Tag, springt die Reihe deshalb nicht.
-pub fn chain_linked_mean(per_bond: &[BTreeMap<NaiveDate, f64>]) -> BTreeMap<NaiveDate, f64> {
-    let dates: Vec<NaiveDate> = per_bond
+/// Letzter Spread einer Anleihe bis einschließlich `day`, höchstens [`SPREAD_CARRY_DAYS`] alt.
+fn carried(series: &BTreeMap<NaiveDate, f64>, day: NaiveDate) -> Option<f64> {
+    let (d, v) = series.range(..=day).next_back()?;
+    ((day - *d).num_days() <= SPREAD_CARRY_DAYS).then_some(*v)
+}
+
+fn union_dates(per_bond: &[BTreeMap<NaiveDate, f64>]) -> Vec<NaiveDate> {
+    per_bond
         .iter()
         .flat_map(|s| s.keys().copied())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
-        .collect();
-    let mean_on = |d: &NaiveDate| {
-        let v: Vec<f64> = per_bond.iter().filter_map(|s| s.get(d).copied()).collect();
-        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
-    };
+        .collect()
+}
+
+/// Stichtagsgetreues Niveau: je Tag der Mittelwert der Anleihen, die bis dahin notiert haben
+/// (fehlende Tage mit dem letzten Spread überbrückt). Spätere Kurse oder später hinzukommende
+/// Anleihen ändern frühere Tage nicht. Kommt eine Anleihe neu dazu, verschiebt sich das Niveau
+/// an diesem Tag um ihren Beitrag zum Mittelwert.
+pub fn point_in_time_mean(per_bond: &[BTreeMap<NaiveDate, f64>]) -> BTreeMap<NaiveDate, f64> {
+    union_dates(per_bond)
+        .into_iter()
+        .filter_map(|d| {
+            let v: Vec<f64> = per_bond.iter().filter_map(|s| carried(s, d)).collect();
+            (!v.is_empty()).then(|| (d, v.iter().sum::<f64>() / v.len() as f64))
+        })
+        .collect()
+}
+
+/// Verkettete Veränderungsreihe in Basispunkten, ab 0 am ersten Tag: Je Tag zählt die
+/// mittlere Veränderung der Anleihen, die an beiden Tagen einen Spread haben. Ein Wechsel im
+/// Korb erzeugt deshalb keinen Sprung. Nur für Veränderungen über die Zeit gedacht, nicht als
+/// Niveau. Rechnet vorwärts, spätere Daten ändern frühere Werte nicht.
+pub fn linked_changes(per_bond: &[BTreeMap<NaiveDate, f64>]) -> BTreeMap<NaiveDate, f64> {
+    let dates = union_dates(per_bond);
     let mut out = BTreeMap::new();
-    let Some(last) = dates.last() else {
+    let Some(first) = dates.first() else {
         return out;
     };
-    let Some(mut level) = mean_on(last) else {
-        return out;
-    };
-    out.insert(*last, level);
-    for w in dates.windows(2).rev() {
+    let mut level = 0.0;
+    out.insert(*first, level);
+    for w in dates.windows(2) {
         let (d0, d1) = (w[0], w[1]);
-        let common: Vec<f64> = per_bond
+        let moves: Vec<f64> = per_bond
             .iter()
-            .filter_map(|s| Some(s.get(&d1)? - s.get(&d0)?))
+            .filter_map(|s| Some(carried(s, d1)? - carried(s, d0)?))
             .collect();
-        if common.is_empty() {
-            // Kein gemeinsamer Bestand an beiden Tagen: Niveau neu aus dem Tagesmittel
-            match mean_on(&d0) {
-                Some(m) => level = m,
-                None => continue,
-            }
-        } else {
-            level -= common.iter().sum::<f64>() / common.len() as f64;
+        if !moves.is_empty() {
+            level += moves.iter().sum::<f64>() / moves.len() as f64;
         }
-        out.insert(d0, level);
+        out.insert(d1, level);
     }
     out
+}
+
+/// Tagesniveau und verkettete Veränderungen eines Emittenten, beide in Basispunkten.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IssuerSpreads {
+    pub level: BTreeMap<NaiveDate, f64>,
+    pub linked: BTreeMap<NaiveDate, f64>,
 }
 
 /// Tagesspreads (Basispunkte) eines Emittenten über seine ausgewählten Anleihen.
@@ -372,13 +405,16 @@ pub fn issuer_spread_series(
     bonds: &[SelectedBond],
     prices: &BTreeMap<i32, BTreeMap<NaiveDate, f64>>,
     treasury: &BTreeMap<String, BTreeMap<NaiveDate, f64>>,
-) -> BTreeMap<NaiveDate, f64> {
+) -> IssuerSpreads {
     let per_bond: Vec<BTreeMap<NaiveDate, f64>> = bonds
         .iter()
         .filter_map(|b| prices.get(&b.conid).map(|px| bond_spread_series(b, px, treasury)))
         .filter(|s| !s.is_empty())
         .collect();
-    chain_linked_mean(&per_bond)
+    IssuerSpreads {
+        level: point_in_time_mean(&per_bond),
+        linked: linked_changes(&per_bond),
+    }
 }
 
 #[cfg(test)]
@@ -490,19 +526,54 @@ mod tests {
         assert!(re.iter().any(|b| b.conid == 2));
     }
 
+    fn pts(values: &[(u32, f64)]) -> BTreeMap<NaiveDate, f64> {
+        values.iter().map(|(day, v)| (d(2026, 11, *day), *v)).collect()
+    }
+
     #[test]
-    fn chain_linking_ignores_basket_changes_but_keeps_moves() {
-        let s = |pts: &[(u32, f64)]| -> BTreeMap<NaiveDate, f64> {
-            pts.iter().map(|(day, v)| (d(2026, 11, *day), *v)).collect()
-        };
+    fn level_is_point_in_time_and_later_bonds_leave_history_alone() {
         // Anleihe A steigt am 2. um 10 bp, Anleihe B kommt am 3. mit höherem Niveau dazu
-        let a = s(&[(1, 300.0), (2, 310.0), (3, 310.0)]);
-        let b = s(&[(3, 410.0)]);
-        let out = chain_linked_mean(&[a, b]);
-        assert!((out[&d(2026, 11, 3)] - 360.0).abs() < 1e-9);
-        assert!((out[&d(2026, 11, 2)] - 360.0).abs() < 1e-9);
-        assert!((out[&d(2026, 11, 1)] - 350.0).abs() < 1e-9);
-        assert!(chain_linked_mean(&[]).is_empty());
+        let a = pts(&[(2, 300.0), (3, 310.0), (4, 310.0)]);
+        let b = pts(&[(4, 410.0)]);
+        let only_a = point_in_time_mean(std::slice::from_ref(&a));
+        let both = point_in_time_mean(&[a, b]);
+        assert_eq!(both[&d(2026, 11, 2)], 300.0);
+        assert_eq!(both[&d(2026, 11, 3)], 310.0);
+        assert_eq!(both[&d(2026, 11, 4)], 360.0);
+        // Frühere Tage sind identisch mit der Reihe ohne die spätere Anleihe
+        for (day, v) in &only_a {
+            if *day < d(2026, 11, 4) {
+                assert_eq!(both[day], *v);
+            }
+        }
+        assert!(point_in_time_mean(&[]).is_empty());
+    }
+
+    #[test]
+    fn level_bridges_short_gaps_without_spikes() {
+        // B fehlt am 3.: Ohne Überbrückung fiele das Mittel auf A allein
+        let a = pts(&[(2, 300.0), (3, 300.0), (4, 300.0)]);
+        let b = pts(&[(2, 500.0), (4, 500.0)]);
+        let out = point_in_time_mean(&[a, b.clone()]);
+        assert_eq!(out[&d(2026, 11, 3)], 400.0);
+        // Nach mehr als SPREAD_CARRY_DAYS fällt eine Anleihe ohne Kurse heraus
+        let a_long = pts(&[(2, 300.0), (12, 300.0)]);
+        let out = point_in_time_mean(&[a_long, b]);
+        assert_eq!(out[&d(2026, 11, 12)], 300.0);
+    }
+
+    #[test]
+    fn linked_changes_ignore_basket_changes_but_keep_moves() {
+        let a = pts(&[(2, 300.0), (3, 310.0), (4, 310.0), (5, 320.0)]);
+        let b = pts(&[(4, 410.0), (5, 430.0)]);
+        let out = linked_changes(&[a, b]);
+        assert_eq!(out[&d(2026, 11, 2)], 0.0);
+        assert_eq!(out[&d(2026, 11, 3)], 10.0);
+        // Eintritt von B am 4.: kein Sprung
+        assert_eq!(out[&d(2026, 11, 4)], 10.0);
+        // Am 5. steigen A um 10 und B um 20: Mittel 15
+        assert_eq!(out[&d(2026, 11, 5)], 25.0);
+        assert!(linked_changes(&[]).is_empty());
     }
 
     #[test]
@@ -521,7 +592,7 @@ mod tests {
         prices.insert(1, BTreeMap::from([(day, 100.0)]));
         prices.insert(2, BTreeMap::from([(day, 95.0)]));
         prices.insert(3, BTreeMap::from([(day, 80.0)]));
-        let s = issuer_spread_series(&bonds, &prices, &tsy);
+        let s = issuer_spread_series(&bonds, &prices, &tsy).level;
         let expect: f64 = bonds
             .iter()
             .map(|b| {

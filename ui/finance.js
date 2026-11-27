@@ -34,18 +34,25 @@ const fin = {
   deps: null,
   views: {}, // gpu -> { view, at }; at = 0 heißt veraltet, wird beim nächsten Anzeigen neu geladen
   inflight: {}, // gpu -> true, solange eine Berechnung läuft
+  version: 0, // steigt mit jeder Invalidierung; Ergebnisse älterer Versionen gelten als veraltet
+  statusEpoch: 0, // steigt mit jedem compute:credit-Event; ältere Statusantworten zählen dann nicht
   again: {}, // gpu -> true, wenn während der Berechnung neue Daten kamen
   seq: 0,
   status: null,
   running: false,
   settingsDirty: false,
   shownSettings: null,
+  // Speichern erst, wenn das Formular einmal mit den gespeicherten Werten gefüllt ist:
+  // Ein leeres Formular würde sonst Emittenten und IB-Schalter überschreiben.
+  settingsLoaded: false,
+  saving: false,
 };
 
 const $ = (id) => document.getElementById(id);
 
 /** Markiert alle Ansichten als veraltet, ohne sie zu verwerfen: Bis die neue Berechnung da ist, bleibt die alte sichtbar. */
 function invalidate() {
+  fin.version += 1;
   for (const entry of Object.values(fin.views)) entry.at = 0;
 }
 
@@ -111,8 +118,13 @@ function dayMs(iso) {
 // Laden
 // ---------------------------------------------------------------------------
 
+function updateSaveButton() {
+  $("fin-save-btn").disabled = !fin.settingsLoaded || fin.saving;
+}
+
 export function initFinance(deps) {
   fin.deps = deps;
+  updateSaveButton();
   $("fin-refresh-btn").addEventListener("click", triggerCreditRefresh);
   $("fin-settings").addEventListener("submit", (evt) => {
     evt.preventDefault();
@@ -124,6 +136,7 @@ export function initFinance(deps) {
     const st = event && event.payload;
     if (!st) return;
     const wasRunning = fin.running;
+    fin.statusEpoch += 1;
     fin.status = st;
     fin.running = !!st.running;
     renderStatus();
@@ -147,12 +160,18 @@ async function load(gpu) {
   }
   fin.inflight[gpu] = true;
   const reqId = ++fin.seq;
+  const version = fin.version;
+  const epoch = fin.statusEpoch;
   try {
     const view = await fin.deps.invoke("get_finance_view", { gpu });
-    fin.views[gpu] = { view, at: Date.now() };
+    // Kamen während der Berechnung neue Daten, gilt das Ergebnis sofort als veraltet
+    fin.views[gpu] = { view, at: version === fin.version ? Date.now() : 0 };
+    // Ein compute:credit-Event ist neuer als der Status dieser Antwort
+    if (epoch === fin.statusEpoch) {
+      fin.status = view.status;
+      fin.running = !!view.status.running;
+    }
     if (reqId !== fin.seq || fin.deps.getGpu() !== gpu || !fin.deps.isActive()) return;
-    fin.status = view.status;
-    fin.running = !!view.status.running;
     draw(view);
   } catch (err) {
     if (reqId !== fin.seq) return;
@@ -171,18 +190,26 @@ async function triggerCreditRefresh() {
   fin.running = true;
   renderStatus();
   fin.deps.showToast("Lade Zinskurve, Kreditaufschläge und Anleihekurse. Der erste IB-Abruf dauert einige Minuten.");
+  let alreadyRunning = false;
   try {
     const st = await fin.deps.invoke("refresh_credit_now");
     fin.status = st;
     const n = st.errors ? st.errors.length : 0;
     fin.deps.showToast(n ? `Kreditdaten aktualisiert, ${n} Hinweis(e) im Datenstand.` : "Kreditdaten aktualisiert.");
   } catch (err) {
-    if (String(err).includes("läuft bereits")) fin.deps.showToast("Der Kreditabruf läuft bereits im Hintergrund.");
+    alreadyRunning = String(err).includes("läuft bereits");
+    if (alreadyRunning) fin.deps.showToast("Der Kreditabruf läuft bereits im Hintergrund.");
     else fin.deps.setActionError("Kreditdaten konnten nicht aktualisiert werden.", err);
   } finally {
-    fin.running = false;
-    renderStatus();
-    reloadIfActive();
+    if (alreadyRunning) {
+      // Der Hintergrundabruf meldet sein Ende per compute:credit; erst dann neu rechnen
+      fin.running = true;
+      renderStatus();
+    } else {
+      fin.running = false;
+      renderStatus();
+      reloadIfActive();
+    }
   }
 }
 
@@ -202,12 +229,17 @@ function readSettingsForm() {
     ib_enabled: $("fin-ib-enabled").checked,
     ib_host: $("fin-ib-host").value.trim(),
     ib_port: Number.isInteger(port) && port >= 0 && port <= 65535 ? port : 0,
-    ib_client_id: Number.isInteger(clientId) && clientId >= 0 ? clientId : 0,
+    ib_client_id: Number.isInteger(clientId) && clientId >= 0 && clientId <= 999999 ? clientId : 0,
     issuers,
   };
 }
 
 async function saveSettings() {
+  if (!fin.settingsLoaded || fin.saving) return;
+  fin.saving = true;
+  updateSaveButton();
+  const form = $("fin-settings");
+  form.setAttribute("aria-busy", "true");
   try {
     const clean = await fin.deps.invoke("save_credit_settings", { settings: readSettingsForm() });
     fin.settingsDirty = false;
@@ -217,6 +249,10 @@ async function saveSettings() {
     reloadIfActive();
   } catch (err) {
     fin.deps.setActionError("Einstellungen nicht gespeichert.", err);
+  } finally {
+    fin.saving = false;
+    form.removeAttribute("aria-busy");
+    updateSaveButton();
   }
 }
 
@@ -253,7 +289,9 @@ function renderRegime(r) {
         <div class="kpi-kicker" data-term="regime">Finanzierungsregime · ${escapeHtml(r.gpu)}</div>
         <div class="fin-regime-title">${regimeChip(r.regime, r.regime_label)}<span class="fin-regime-since mono">${escapeHtml(since)}</span></div>
       </div>
-      <div class="fin-regime-side mono">Stand ${escapeHtml(fmtDay(r.as_of))}</div>
+      <div class="fin-regime-side mono">Stand ${escapeHtml(fmtDay(r.as_of))}${
+        r.classified_until && r.classified_until !== r.as_of ? `<br>Einstufung bis ${escapeHtml(fmtDay(r.classified_until))}` : ""
+      }</div>
     </div>
     <p class="fin-regime-text">${escapeHtml(r.regime_explanation)}</p>`);
 
@@ -263,7 +301,7 @@ function renderRegime(r) {
       : `Kreditseite: ${r.credit_stress ? "unter Stress" : "ruhig"} (Stressindex ${fmt(r.fsi)}).`;
     const curve = r.curve_days < r.curve_days_needed
       ? `GPU-Seite: ${r.curve_days} von ${r.curve_days_needed} Kurventagen gesammelt.`
-      : "GPU-Seite: Kurvenhistorie vorhanden.";
+      : "GPU-Seite: genug Kurventage gesammelt.";
     parts.push(`<p class="fin-regime-partial">${escapeHtml(credit)} ${escapeHtml(curve)}</p>`);
   }
   if (r.early_warning) {
@@ -414,10 +452,12 @@ function issuerRow(i) {
 }
 
 function fillSettings(s, force) {
-  if (!s || (fin.settingsDirty && !force)) return;
+  if (!s || fin.saving || (fin.settingsDirty && !force)) return;
   const sig = JSON.stringify(s);
   if (!force && fin.shownSettings === sig) return;
   fin.shownSettings = sig;
+  fin.settingsLoaded = true;
+  updateSaveButton();
   $("fin-ib-enabled").checked = !!s.ib_enabled;
   $("fin-ib-host").value = s.ib_host || "127.0.0.1";
   $("fin-ib-port").value = String(s.ib_port ?? 0);

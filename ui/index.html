@@ -404,7 +404,7 @@
                 <label class="ka-check"><input type="checkbox" id="fin-ib-enabled"> Anleihekurse über IB laden</label>
                 <label class="fin-field">Host <input class="ka-input mono" id="fin-ib-host" maxlength="253" spellcheck="false"></label>
                 <label class="fin-field">Port <input class="ka-input mono" id="fin-ib-port" type="number" min="0" max="65535" step="1"></label>
-                <label class="fin-field">Client-ID <input class="ka-input mono" id="fin-ib-client" type="number" min="0" step="1"></label>
+                <label class="fin-field">Client-ID <input class="ka-input mono" id="fin-ib-client" type="number" min="0" max="999999" step="1"></label>
                 <p class="section-sub">Port 0 probiert 7496, 7497, 4001 und 4002. Client-ID 0 wählt eine freie ID aus 8300 bis 8399.</p>
               </fieldset>
               <fieldset class="fin-fieldset">
@@ -413,7 +413,7 @@
                 <p class="section-sub">Agenturrating als Vergleichswert, zum Beispiel BBB- oder Baa2. Die Voreinstellungen sind eigene Annahmen zum Stand November 2026.</p>
               </fieldset>
               <div class="toolbar-cluster">
-                <button type="submit" class="ka-btn ka-btn-ghost" id="fin-save-btn">Einstellungen speichern</button>
+                <button type="submit" class="ka-btn ka-btn-ghost" id="fin-save-btn" disabled>Einstellungen speichern</button>
               </div>
             </form>
           </section>

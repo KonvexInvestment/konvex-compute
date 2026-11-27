@@ -38,6 +38,9 @@ const MAX_FLAT_EXTRAPOLATION_DAYS: i64 = 45;
 
 /// OAS-Werte gelten so lange fort (Wochenenden, Feiertage).
 const OAS_MAX_AGE_DAYS: i64 = 5;
+/// ICE BofA veröffentlicht den OAS eines Tages erst am folgenden Geschäftstag. Für einen
+/// Stichtag zählen deshalb nur Beobachtungen bis zum Vortag.
+const OAS_PUBLICATION_LAG_DAYS: i64 = 1;
 /// Emittenten-Spreads gelten so lange fort, danach als veraltet ausgeblendet.
 const ISSUER_MAX_AGE_DAYS: i64 = 7;
 /// Fenster und Mindestumfang des robusten z-Werts für OAS-Niveaus (Beobachtungen).
@@ -77,6 +80,12 @@ const BOCPD_RECENT: usize = 7;
 const BOCPD_SIGNAL: f64 = 0.5;
 /// Vor so vielen Beobachtungen ist die Bruchwahrscheinlichkeit nicht aussagekräftig.
 const BOCPD_WARMUP: usize = 30;
+/// Normierung der Bruchpunkt-Erkennung: robuste Streuung der vorherigen Beobachtungen,
+/// höchstens so viele, und erst ab so vielen.
+const BOCPD_SCALE_WINDOW: usize = 756;
+const BOCPD_SCALE_MIN_OBS: usize = 10;
+/// Liegt die letzte vollständige Einstufung länger zurück, gilt das Regime als unbekannt.
+const REGIME_STALE_DAYS: i64 = 3;
 
 /// Die GPU-Seite braucht mindestens so viele Kurventage (14-Tage-Änderung plus heute).
 pub const CURVE_DAYS_NEEDED: usize = FALL_SHORT_DAYS as usize + 1;
@@ -183,7 +192,6 @@ impl RatingBucket {
 
 /// FRED-Kennungen der Makro-Komponenten des Stressindex.
 pub const OAS_HY: &str = "BAMLH0A0HYM2";
-pub const OAS_IG: &str = "BAMLC0A0CM";
 
 /// Makro-Komponenten: Hochzins gesamt, CCC und BBB (Investment-Grade-Rand).
 const MACRO_COMPONENTS: [(&str, &str); 3] = [
@@ -236,7 +244,10 @@ pub struct IssuerSeries {
     pub key: String,
     pub label: String,
     pub agency_rating: String,
+    /// Stichtagsgetreues Niveau (Mittel der Anleihen, die bis dahin notiert haben).
     pub spreads_bp: Series,
+    /// Verkettete Veränderungen ohne Sprünge bei Korbwechseln, nur für Differenzen.
+    pub linked_bp: Series,
     /// Kurzbeschreibung der verwendeten Anleihen (z. B. "ORCL 5 1/4 02/03/32").
     pub bonds: Vec<String>,
 }
@@ -371,6 +382,8 @@ pub struct RegimeReport {
     pub regime_label: String,
     pub regime_explanation: String,
     pub regime_since: Option<NaiveDate>,
+    /// Letzter Tag mit vollständiger Einstufung (Kredit- und Kurvendaten).
+    pub classified_until: Option<NaiveDate>,
     pub early_warning: bool,
     pub warnings: Vec<String>,
     /// Stresszustand der Kreditseite nach Hysterese, auch wenn die GPU-Seite noch fehlt.
@@ -544,18 +557,28 @@ impl NigParams {
 /// Normal-Invers-Gamma-Modell und konstanter Bruchrate.
 ///
 /// Gibt je Beobachtung die Wahrscheinlichkeit zurück, dass der letzte Bruch
-/// weniger als `recent` Beobachtungen zurückliegt. Die Eingabe wird vorher auf
-/// ihre robuste Streuung normiert, damit die Vorannahmen einheitenfrei bleiben.
+/// weniger als `recent` Beobachtungen zurückliegt. Jede Beobachtung wird auf die
+/// robuste Streuung der vorherigen normiert (höchstens [`BOCPD_SCALE_WINDOW`]), damit
+/// die Vorannahmen einheitenfrei bleiben und spätere Daten frühere Werte nicht ändern.
+/// Vor [`BOCPD_SCALE_MIN_OBS`] vorherigen Beobachtungen bleibt der Wert NaN.
 pub fn bocpd_recent_break(xs: &[f64], hazard_lambda: f64, recent: usize, max_run: usize) -> Vec<f64> {
     if xs.is_empty() {
         return Vec::new();
     }
-    let mut abs_dev: Vec<f64> = {
-        let mut v: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
-        let med = median(&mut v).unwrap_or(0.0);
-        v.iter().map(|x| (x - med).abs()).collect()
+    let mut seen: Vec<f64> = Vec::new();
+    let mut scale_before = |x: f64| -> Option<f64> {
+        let start = seen.len().saturating_sub(BOCPD_SCALE_WINDOW);
+        let scale = (seen.len() >= BOCPD_SCALE_MIN_OBS)
+            .then(|| {
+                let mut win = seen[start..].to_vec();
+                let med = median(&mut win)?;
+                let mut dev: Vec<f64> = win.iter().map(|v| (v - med).abs()).collect();
+                median(&mut dev).map(|m| m * 1.4826).filter(|s| *s > 1e-12)
+            })
+            .flatten();
+        seen.push(x);
+        scale
     };
-    let scale = median(&mut abs_dev).map(|m| m * 1.4826).filter(|s| *s > 1e-12).unwrap_or(1.0);
     let log_h = (1.0 / hazard_lambda).ln();
     let log_1mh = (1.0 - 1.0 / hazard_lambda).ln();
 
@@ -567,6 +590,10 @@ pub fn bocpd_recent_break(xs: &[f64], hazard_lambda: f64, recent: usize, max_run
             out.push(f64::NAN);
             continue;
         }
+        let Some(scale) = scale_before(raw) else {
+            out.push(f64::NAN);
+            continue;
+        };
         let x = raw / scale;
         let pred: Vec<f64> = params.iter().map(|p| p.predictive_logpdf(x)).collect();
         let joint: Vec<f64> = log_run.iter().zip(&pred).map(|(r, p)| r + p).collect();
@@ -703,22 +730,24 @@ pub fn implied_position(spread_bp: f64, bucket_oas_bp: &[Option<f64>; 7]) -> Opt
     if s <= pts[0].1 {
         return Some(pts[0].0 as f64);
     }
-    for w in pts.windows(2) {
-        let ((i0, l0), (i1, l1)) = (w[0], w[1]);
-        if l1 <= l0 {
-            continue; // nicht monotone Stufe überspringen
-        }
-        if s <= l1 && s >= l0 {
-            return Some(i0 as f64 + (i1 - i0) as f64 * (s - l0) / (l1 - l0));
+    // Abschnitte von Stufe zu Stufe, aber nur ansteigend: Liegt eine schlechtere Stufe zeitweise
+    // nicht über der vorherigen (etwa AA unter AAA), reicht der Abschnitt über sie hinweg.
+    // So bleibt die Position stetig und springt nicht um eine ganze Stufe.
+    let mut seg = pts[0];
+    let mut last_rise: Option<((usize, f64), (usize, f64))> = None;
+    for p in &pts[1..] {
+        if p.1 > seg.1 {
+            if s <= p.1 {
+                return Some(seg.0 as f64 + (p.0 - seg.0) as f64 * (s - seg.1) / (p.1 - seg.1));
+            }
+            last_rise = Some((seg, *p));
+            seg = *p;
         }
     }
-    let n = pts.len();
-    let ((i0, l0), (i1, l1)) = (pts[n - 2], pts[n - 1]);
-    if l1 > l0 && s > l1 {
-        let ext = i1 as f64 + (i1 - i0) as f64 * (s - l1) / (l1 - l0);
-        return Some(ext.min(7.0));
-    }
-    None
+    // Oberhalb der höchsten Stufe: mit der Steigung des letzten ansteigenden Abschnitts
+    let ((i0, l0), (i1, l1)) = last_rise?;
+    let ext = i1 as f64 + (i1 - i0) as f64 * (s - l1) / (l1 - l0);
+    Some(ext.min(7.0))
 }
 
 fn bucket_label_for(position: f64) -> &'static str {
@@ -726,12 +755,18 @@ fn bucket_label_for(position: f64) -> &'static str {
     RatingBucket::ALL[idx].label()
 }
 
+/// Letztes Beobachtungsdatum der OAS-Reihen, das am Stichtag schon veröffentlicht war.
+fn oas_known_until(day: NaiveDate) -> NaiveDate {
+    day - Duration::days(OAS_PUBLICATION_LAG_DAYS)
+}
+
+/// OAS-Raster (Basispunkte) je Ratingstufe, wie es am Stichtag bekannt war.
 fn bucket_oas_asof(oas: &BTreeMap<String, Series>, day: NaiveDate) -> [Option<f64>; 7] {
     let mut out = [None; 7];
     for b in RatingBucket::ALL {
         out[b.index()] = oas
             .get(b.oas_series())
-            .and_then(|s| value_asof(s, day, OAS_MAX_AGE_DAYS))
+            .and_then(|s| value_asof(s, oas_known_until(day), OAS_MAX_AGE_DAYS))
             .map(|(_, v)| v * 100.0);
     }
     out
@@ -747,6 +782,29 @@ struct StressDay {
     ai_block: Option<f64>,
     fsi: Option<f64>,
     max_position: Option<f64>,
+    /// Welche Quellen (OAS-Komponenten, Emittenten) in den Index eingehen, als Bitmaske.
+    composition: u64,
+    /// Fingerabdruck der Beobachtungsdaten aller Quellen: ändert sich nur mit neuen Daten.
+    data_stamp: u64,
+}
+
+impl StressDay {
+    /// Veränderung des Stressindex gegenüber `prev`, nur bei neuen Daten und gleicher
+    /// Zusammensetzung: Fortgeschriebene Wochenenden wären sonst künstliche Nullen, ein
+    /// hinzukommender oder wegfallender KI-Block ein künstlicher Sprung.
+    fn fsi_change_since(&self, prev: &StressDay, require_new_data: bool) -> Option<f64> {
+        if self.composition != prev.composition || (require_new_data && self.data_stamp == prev.data_stamp) {
+            return None;
+        }
+        Some(self.fsi? - prev.fsi?)
+    }
+}
+
+fn stamp_of(dates: &[Option<NaiveDate>]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    dates.hash(&mut h);
+    h.finish()
 }
 
 fn mean(values: &[f64]) -> Option<f64> {
@@ -793,16 +851,12 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
         .collect();
     let issuer_gaps = issuer_gap_series(inputs);
 
-    // 2. Kalender: vom frühesten Kredit- oder Kurvendatum bis heute, höchstens HISTORY_DAYS + Vorlauf
+    // 2. Kalender: vom frühesten Kredit- oder Kurvendatum bis heute. Der Start hängt nur an
+    // den Daten, nicht am heutigen Datum: So bleiben frühere Tageswerte bei späteren Läufen gleich.
     let price = price_days(&inputs.curve);
     let first_credit = inputs.oas.values().filter_map(|s| s.keys().next()).min().copied();
     let first_price = price.keys().next().copied();
-    let start_floor = today - Duration::days(HISTORY_DAYS + COUPLING_WINDOW_DAYS + 60);
-    let start = [first_credit, first_price]
-        .into_iter()
-        .flatten()
-        .min()
-        .map(|d| d.max(start_floor));
+    let start = [first_credit, first_price].into_iter().flatten().min().filter(|d| *d <= today);
     let Some(start) = start else {
         notes.push("Noch keine Kredit- oder Kurvendaten vorhanden.".into());
         return empty_report(inputs, today, notes);
@@ -811,15 +865,22 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
     let mut stress: BTreeMap<NaiveDate, StressDay> = BTreeMap::new();
     let mut day = start;
     while day <= today {
+        let mut source_dates: Vec<Option<NaiveDate>> = Vec::new();
         let macro_scores: Vec<f64> = macro_z
             .iter()
-            .filter_map(|(_, _, z)| value_asof(z, day, OAS_MAX_AGE_DAYS).map(|(_, v)| v))
+            .filter_map(|(_, _, z)| {
+                let hit = value_asof(z, oas_known_until(day), OAS_MAX_AGE_DAYS);
+                source_dates.push(hit.map(|(d, _)| d));
+                hit.map(|(_, v)| v)
+            })
             .collect();
         let macro_block = (macro_scores.len() >= 2).then(|| mean(&macro_scores)).flatten();
         let mut gaps = Vec::new();
         let mut max_pos: Option<f64> = None;
         for (_, gap, pos) in &issuer_gaps {
-            if let Some((_, g)) = value_asof(gap, day, ISSUER_MAX_AGE_DAYS) {
+            let hit = value_asof(gap, day, ISSUER_MAX_AGE_DAYS);
+            source_dates.push(hit.map(|(d, _)| d));
+            if let Some((_, g)) = hit {
                 gaps.push(g);
             }
             if let Some((_, p)) = value_asof(pos, day, ISSUER_MAX_AGE_DAYS) {
@@ -833,6 +894,11 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
             (None, Some(a)) => Some(a),
             (None, None) => None,
         };
+        let composition = source_dates
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.is_some())
+            .fold(0u64, |acc, (i, _)| acc | (1u64 << (i % 64)));
         stress.insert(
             day,
             StressDay {
@@ -840,6 +906,8 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
                 ai_block,
                 fsi,
                 max_position: max_pos,
+                composition,
+                data_stamp: stamp_of(&source_dates),
             },
         );
         day += Duration::days(1);
@@ -857,9 +925,11 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
         .collect();
     let fsi_changes: Vec<f64> = days
         .iter()
-        .map(|d| match (stress[d].fsi, stress.get(&(*d - Duration::days(1))).and_then(|s| s.fsi)) {
-            (Some(a), Some(b)) => a - b,
-            _ => f64::NAN,
+        .map(|d| {
+            stress
+                .get(&(*d - Duration::days(1)))
+                .and_then(|prev| stress[d].fsi_change_since(prev, true))
+                .unwrap_or(f64::NAN)
         })
         .collect();
     let mut price_break = bocpd_recent_break(&price_changes, BOCPD_HAZARD_LAMBDA, BOCPD_RECENT, BOCPD_MAX_RUN);
@@ -875,6 +945,8 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
     let mut candidate_days = 0usize;
     let mut candidate_start = start;
     let mut regime_since: Option<NaiveDate> = None;
+    let mut last_classified: Option<NaiveDate> = None;
+    let mut needed = CONFIRM_DAYS;
     let mut transitions = Vec::new();
     let mut history = Vec::new();
     let history_start = today - Duration::days(HISTORY_DAYS);
@@ -909,8 +981,13 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
             }
         };
 
-        // Bestätigung: Fehlende Daten ändern das bestätigte Regime nicht
-        if raw != Regime::Unbekannt {
+        // Bestätigung: Fehlende Daten ändern das bestätigte Regime nicht, unterbrechen aber
+        // die Zählung eines neuen Kandidaten.
+        if raw == Regime::Unbekannt {
+            candidate = confirmed;
+            candidate_days = 0;
+        } else {
+            last_classified = Some(*d);
             if raw == confirmed {
                 candidate = confirmed;
                 candidate_days = 0;
@@ -927,8 +1004,13 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
                     .iter()
                     .any(|p| p.is_finite() && *p >= BOCPD_SIGNAL)
                     || coupling_at(&price, &stress, *d).corr.is_some_and(|c| c <= COUPLING_NEGATIVE_CORR);
-                let needed = if raw == Regime::Uebertragung && !evidence {
+                // Die erste Einstufung nach „Unbekannt“ braucht keine Bestätigung: Die Regel soll ein
+                // Hin und Her zwischen Regimen dämpfen, nicht die erste Einordnung verzögern.
+                // Eine Übertragung braucht sie immer.
+                needed = if raw == Regime::Uebertragung && !evidence {
                     CONFIRM_DAYS_WITHOUT_EVIDENCE
+                } else if confirmed == Regime::Unbekannt && raw != Regime::Uebertragung {
+                    1
                 } else {
                     CONFIRM_DAYS
                 };
@@ -992,12 +1074,12 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
     let macro_components = macro_z
         .iter()
         .map(|(id, label, z)| {
-            let raw = inputs.oas.get(*id).and_then(|s| value_asof(s, last, OAS_MAX_AGE_DAYS));
+            let raw = inputs.oas.get(*id).and_then(|s| value_asof(s, oas_known_until(last), OAS_MAX_AGE_DAYS));
             ComponentReading {
                 key: (*id).into(),
                 label: (*label).into(),
                 value: raw.map(|(_, v)| v),
-                score: value_asof(z, last, OAS_MAX_AGE_DAYS).map(|(_, v)| v),
+                score: value_asof(z, oas_known_until(last), OAS_MAX_AGE_DAYS).map(|(_, v)| v),
                 as_of: raw.map(|(d, _)| d),
             }
         })
@@ -1011,8 +1093,10 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
             let fresh = latest.filter(|(d, _)| (last - *d).num_days() <= ISSUER_MAX_AGE_DAYS);
             let agency = RatingBucket::from_rating(&iss.agency_rating);
             let position = latest.and_then(|(d, v)| implied_position(v, &bucket_oas_asof(&inputs.oas, d)));
-            let change_30d = latest.and_then(|(d, v)| {
-                value_asof(&iss.spreads_bp, d - Duration::days(30), ISSUER_MAX_AGE_DAYS).map(|(_, old)| v - old)
+            let change_30d = latest.and_then(|(d, _)| {
+                let (_, now) = value_asof(&iss.linked_bp, d, 0)?;
+                let (_, then) = value_asof(&iss.linked_bp, d - Duration::days(30), ISSUER_MAX_AGE_DAYS)?;
+                Some(now - then)
             });
             IssuerReading {
                 key: iss.key.clone(),
@@ -1036,6 +1120,7 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
 
     // 6. Vorwarnung: Entkoppelt, aber Anzeichen, dass der Stress auf die Mieten übergreift
     let mut warnings = Vec::new();
+    let mut gpu_signals = 0usize;
     if let Some(p) = s_last.max_position.filter(|p| *p >= DISTRESS_POSITION) {
         warnings.push(format!(
             "Mindestens ein beobachteter Emittent handelt am Anleihemarkt im Notlagenbereich (Stufe {}).",
@@ -1047,9 +1132,11 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
             && price_reading.near_change_14d_pct.is_some_and(|n| n < 0.0)
         {
             warnings.push("Der Spot fällt stärker als die nahe Kurve, die Basis sinkt.".into());
+            gpu_signals += 1;
         }
         if coupling.corr.is_some_and(|c| c <= COUPLING_NEGATIVE_CORR) && coupling.beta.is_some_and(|b| b < 0.0) {
             warnings.push("Steigender Kreditstress ging zuletzt fallenden Kurvenpreisen voraus (negative Kopplung).".into());
+            gpu_signals += 1;
         }
         let n = price_break.len();
         if price_break[n.saturating_sub(BOCPD_RECENT)..]
@@ -1057,9 +1144,33 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
             .any(|p| p.is_finite() && *p >= BOCPD_SIGNAL)
         {
             warnings.push("Die Bruchpunkt-Erkennung meldet einen frischen Bruch in der nahen Kurve.".into());
+            gpu_signals += 1;
         }
     }
-    let early_warning = confirmed == Regime::Entkoppelt && !warnings.is_empty();
+    // Ohne vollständige Einstufung in den letzten Tagen kein altes Regime mit heutigem Datum zeigen
+    let (shown, shown_since) = match last_classified {
+        Some(d) if (last - d).num_days() <= REGIME_STALE_DAYS => (confirmed, regime_since),
+        Some(d) if confirmed != Regime::Unbekannt => {
+            notes.push(format!(
+                "Seit dem {} fehlen Kredit- oder Kurvendaten für eine Einstufung. Zuletzt bestätigt: {}.",
+                d.format("%d.%m.%Y"),
+                confirmed.label()
+            ));
+            (Regime::Unbekannt, None)
+        }
+        _ => (Regime::Unbekannt, None),
+    };
+    // Vorwarnung nur bei Anzeichen auf der GPU-Seite; eine Notlage am Anleihemarkt allein
+    // bleibt ein Hinweis auf der Kreditseite.
+    let early_warning = shown == Regime::Entkoppelt && gpu_signals > 0;
+    if candidate != confirmed && candidate_days > 0 && last_classified == Some(last) {
+        notes.push(format!(
+            "Neues Regime in Prüfung: {} seit {} Tag(en), bestätigt nach {}.",
+            candidate.label(),
+            candidate_days,
+            needed
+        ));
+    }
 
     if inputs.issuers.iter().all(|i| i.spreads_bp.is_empty()) {
         notes.push("Keine Emittenten-Spreads: Der Stressindex beruht nur auf den OAS-Reihen.".into());
@@ -1071,10 +1182,11 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
     RegimeReport {
         gpu: inputs.gpu.clone(),
         as_of: Some(last),
-        regime: confirmed,
-        regime_label: confirmed.label().into(),
-        regime_explanation: confirmed.explanation().into(),
-        regime_since,
+        regime: shown,
+        regime_label: shown.label().into(),
+        regime_explanation: shown.explanation().into(),
+        regime_since: shown_since,
+        classified_until: last_classified,
         early_warning,
         warnings,
         credit_stress: stress_high,
@@ -1134,6 +1246,10 @@ pub fn next_falling_state(falling: bool, f: &FallSignal) -> bool {
         let spot_confirms = f.dbasis.is_none_or(|b| b <= 0.0);
         (short || long) && spot_confirms
     } else {
+        // Ohne Kursänderungen (fehlender Kurventag) bleibt der Zustand wie beim Stress
+        if f.dn14.is_none() && f.dn30.is_none() {
+            return true;
+        }
         let short_ok = f.dn14.is_none_or(|v| v > FALL_SHORT_EXIT);
         let long_ok = f.dn30.is_none_or(|v| v > FALL_LONG_EXIT);
         !(short_ok && long_ok)
@@ -1153,14 +1269,13 @@ fn coupling_at(
     while t <= day {
         let y = log_change(
             lookup_price(price, t, 0).and_then(|p| p.near),
-            lookup_price(price, t - Duration::days(COUPLING_STEP_DAYS), 2).and_then(|p| p.near),
+            // Exakt sieben Tage: Ein früherer Ersatztag würde das Preisfenster in das
+            // Stressfenster hinein verlängern.
+            lookup_price(price, t - Duration::days(COUPLING_STEP_DAYS), 0).and_then(|p| p.near),
         );
         let x_end = t - Duration::days(COUPLING_LAG_DAYS);
-        let x = match (
-            stress.get(&x_end).and_then(|s| s.fsi),
-            stress.get(&(x_end - Duration::days(COUPLING_STEP_DAYS))).and_then(|s| s.fsi),
-        ) {
-            (Some(a), Some(b)) => Some(a - b),
+        let x = match (stress.get(&x_end), stress.get(&(x_end - Duration::days(COUPLING_STEP_DAYS)))) {
+            (Some(a), Some(b)) => a.fsi_change_since(b, false),
             _ => None,
         };
         if let (Some(x), Some(y)) = (x, y) {
@@ -1187,6 +1302,7 @@ fn empty_report(inputs: &ModelInputs, today: NaiveDate, notes: Vec<String>) -> R
         regime_label: Regime::Unbekannt.label().into(),
         regime_explanation: Regime::Unbekannt.explanation().into(),
         regime_since: None,
+        classified_until: None,
         early_warning: false,
         warnings: Vec::new(),
         credit_stress: false,

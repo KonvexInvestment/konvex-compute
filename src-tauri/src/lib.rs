@@ -247,7 +247,10 @@ impl AppState {
         let mut treasury_ok = false;
         match fetch_treasury_curve(&self.client, from_for(TREASURY_ANCHOR_SERIES), today).await {
             Ok(curve) => {
-                treasury_ok = !curve.is_empty();
+                treasury_ok = curve.get(TREASURY_ANCHOR_SERIES).is_some_and(|v| !v.is_empty());
+                if !treasury_ok {
+                    errors.push("Treasury.gov: keine Renditen im Abrufzeitraum".into());
+                }
                 for (id, points) in &curve {
                     if let Err(e) = self.store.save_credit_series(id, points) {
                         errors.push(e);
@@ -258,9 +261,13 @@ impl AppState {
             Err(e) => errors.push(e),
         }
 
+        // Eine Reihe zählt nur mit mindestens einem Wert: Eine Antwort mit passendem Kopf, aber
+        // ohne lesbare Werte ist ein Teilfehler und führt zum kürzeren Wiederholungsabstand.
+        let fred_ids = fred_series_ids();
         let mut fred_ok = 0usize;
-        for id in fred_series_ids() {
+        for id in &fred_ids {
             match fetch_fred_series(&self.fred_client, id, from_for(id)).await {
+                Ok(points) if points.is_empty() => errors.push(format!("FRED {id}: keine Werte im Abrufzeitraum")),
                 Ok(points) => match self.store.save_credit_series(id, &points) {
                     Ok(_) => fred_ok += 1,
                     Err(e) => errors.push(e),
@@ -300,7 +307,9 @@ impl AppState {
         }
 
         let _ = self.store.set_meta("credit_last_attempt_at", &now_s);
-        if fred_ok > 0 && treasury_ok {
+        // Erfolg nur, wenn Zinskurve und alle OAS-Reihen da sind; sonst neuer Versuch nach
+        // CREDIT_RETRY_MIN statt erst nach CREDIT_REFRESH_HOURS.
+        if fred_ok == fred_ids.len() && treasury_ok {
             let _ = self.store.set_meta("credit_last_success_at", &now_s);
         }
         let _ = self.store.set_meta(
@@ -327,7 +336,7 @@ impl AppState {
     fn finance_view(&self, gpu: &str) -> Result<FinanceView, String> {
         let settings = self.store.load_credit_settings();
         let today = chrono::Utc::now().date_naive();
-        let (inputs, bonds) = self.store.build_model_inputs(gpu, &settings, today)?;
+        let (inputs, bonds) = self.store.build_model_inputs(gpu, &settings)?;
         Ok(FinanceView {
             report: compute_regime(&inputs, today),
             bonds,

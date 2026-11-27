@@ -9,7 +9,7 @@
 
 use crate::credit::{rank_bond_candidates, BondListing, SelectedBond, BONDS_PER_ISSUER, TREASURY_SERIES};
 use chrono::Datelike;
-use crate::regime::{RatingBucket, OAS_HY, OAS_IG};
+use crate::regime::{RatingBucket, OAS_HY};
 use chrono::NaiveDate;
 use ibapi::contracts::SecurityType;
 use ibapi::market_data::historical::{Bar, BarTimestamp};
@@ -35,6 +35,10 @@ pub const FRED_OVERLAP_DAYS: i64 = 21;
 pub const IB_DEFAULT_PORTS: [u16; 4] = [7496, 7497, 4001, 4002];
 /// Eigener Bereich für Client-IDs, damit andere API-Programme nicht verdrängt werden.
 const IB_CLIENT_ID_RANGE: (i32, i32) = (8300, 8399);
+/// Obergrenze für eine fest eingestellte Client-ID.
+pub const IB_CLIENT_ID_MAX: i32 = 999_999;
+/// IB erlaubt höchstens 60 Historienabfragen je zehn Minuten; etwas Abstand dazu.
+const IB_HIST_PACING: (usize, Duration) = (55, Duration::from_secs(600));
 const IB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IB_DETAILS_TIMEOUT: Duration = Duration::from_secs(30);
 /// IB beantwortet Anleihehistorien langsam (ein Monat 5 bis 15 s, ein Jahr 35 bis 45 s)
@@ -48,6 +52,8 @@ const IB_REQUEST_GAP: Duration = Duration::from_millis(400);
 const IB_MAX_NEW_TRIES_PER_ISSUER: usize = 5;
 /// Gesamtbudget eines IB-Abrufs über alle Emittenten (läuft im Hintergrund).
 const IB_TOTAL_BUDGET: Duration = Duration::from_secs(20 * 60);
+/// Unter diesem Restbudget startet keine neue Anfrage mehr.
+const IB_MIN_REQUEST_BUDGET: Duration = Duration::from_secs(5);
 /// Mindestzahl an Handelstagen, damit eine Anleihe in den Korb kommt (etwa drei Monate).
 const MIN_HISTORY_BARS: usize = 60;
 /// Eine bisherige Anleihe ohne neue Kurse bleibt so lange im Korb, danach wird neu gewählt.
@@ -57,7 +63,7 @@ pub const BOND_PRICE_SOURCE: &str = "bid";
 
 /// Alle FRED-Reihen, die das Modell braucht (nur ICE-BofA-OAS).
 pub fn fred_series_ids() -> Vec<&'static str> {
-    let mut ids: Vec<&'static str> = vec![OAS_HY, OAS_IG];
+    let mut ids: Vec<&'static str> = vec![OAS_HY];
     ids.extend(RatingBucket::ALL.iter().map(|b| b.oas_series()));
     ids
 }
@@ -135,8 +141,8 @@ impl CreditSettings {
         if self.ib_host.len() > 253 || !self.ib_host.chars().all(|c| c.is_ascii_alphanumeric() || ".-:".contains(c)) {
             return Err("Ungültiger Hostname für die IB-Verbindung.".into());
         }
-        if self.ib_client_id < 0 {
-            return Err("Die Client-ID muss 0 (automatisch) oder positiv sein.".into());
+        if !(0..=IB_CLIENT_ID_MAX).contains(&self.ib_client_id) {
+            return Err(format!("Die Client-ID muss 0 (automatisch) oder höchstens {IB_CLIENT_ID_MAX} sein."));
         }
         if self.issuers.len() > 10 {
             return Err("Höchstens zehn Emittenten.".into());
@@ -277,9 +283,20 @@ pub async fn fetch_treasury_curve(
         let url = format!(
             "{TREASURY_CSV}/{year}/all?type=daily_treasury_yield_curve&field_tdr_date_value={year}&page&_format=csv"
         );
-        let body = get_text_with_retry(client, &url, &format!("Treasury.gov {year}")).await?;
-        for (id, pts) in parse_treasury_csv(&body)? {
-            out.entry(id).or_default().extend(pts.into_iter().filter(|(d, _)| *d >= from));
+        let parsed = match get_text_with_retry(client, &url, &format!("Treasury.gov {year}")).await {
+            Ok(body) => parse_treasury_csv(&body),
+            Err(e) => Err(e),
+        };
+        match parsed {
+            Ok(curve) => {
+                for (id, pts) in curve {
+                    out.entry(id).or_default().extend(pts.into_iter().filter(|(d, _)| *d >= from));
+                }
+            }
+            // Zu Jahresbeginn hat die Datei des neuen Jahres oft noch keine Zeilen: Dann
+            // zählen die Vorjahre, statt den ganzen Abruf zu verwerfen.
+            Err(_) if year == today.year() && out.values().any(|v| !v.is_empty()) => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(out)
@@ -316,16 +333,23 @@ pub struct IbFetchOutcome {
     pub errors: Vec<String>,
 }
 
-fn pick_client_id(configured: i32, attempt: u32) -> i32 {
+/// Client-ID je Versuch: eine fest eingestellte ID bleibt immer dieselbe, sonst eine ID aus
+/// [`IB_CLIENT_ID_RANGE`], je Verbindungslauf zufällig gestartet und je Versuch versetzt.
+fn pick_client_id(configured: i32, seed: u32, attempt: u32) -> i32 {
     if configured > 0 {
-        return configured + attempt as i32;
+        return configured;
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
     let span = (IB_CLIENT_ID_RANGE.1 - IB_CLIENT_ID_RANGE.0 + 1) as u32;
-    IB_CLIENT_ID_RANGE.0 + ((nanos / 1000 + attempt * 37) % span) as i32
+    IB_CLIENT_ID_RANGE.0 + ((seed.wrapping_add(attempt.wrapping_mul(37))) % span) as i32
+}
+
+/// Adresse für den Socket: IPv6-Literale brauchen eckige Klammern.
+fn socket_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 async fn port_open(host: &str, port: u16) -> bool {
@@ -342,13 +366,19 @@ async fn connect_ib(settings: &CreditSettings) -> Result<(Client, u16), String> 
         vec![settings.ib_port]
     };
     let mut last_err = String::from("keine TWS und kein IB Gateway erreichbar");
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_micros())
+        .unwrap_or(0);
+    // Fest eingestellte ID: ein Versuch, keine fremden IDs ausprobieren
+    let attempts = if settings.ib_client_id > 0 { 1 } else { 3 };
     for port in ports {
         if !port_open(&settings.ib_host, port).await {
             continue;
         }
-        for attempt in 0..3 {
-            let client_id = pick_client_id(settings.ib_client_id, attempt);
-            let addr = format!("{}:{port}", settings.ib_host);
+        for attempt in 0..attempts {
+            let client_id = pick_client_id(settings.ib_client_id, seed, attempt);
+            let addr = socket_addr(&settings.ib_host, port);
             match tokio::time::timeout(IB_CONNECT_TIMEOUT, Client::connect(&addr, client_id)).await {
                 Ok(Ok(client)) => return Ok((client, port)),
                 Ok(Err(e)) => last_err = format!("Port {port}: {e}"),
@@ -395,6 +425,62 @@ async fn fetch_bid_bars(
     }
 }
 
+/// Hält das IB-Limit für Historienabfragen ein (siehe [`IB_HIST_PACING`]).
+#[derive(Default)]
+struct HistPacer {
+    sent: std::collections::VecDeque<tokio::time::Instant>,
+}
+
+impl HistPacer {
+    /// Wartet, bis eine weitere Historienabfrage ins Limit passt. `false`, wenn das Warten
+    /// über das Zeitbudget hinausginge.
+    async fn ready(&mut self, deadline: tokio::time::Instant) -> bool {
+        let (limit, window) = IB_HIST_PACING;
+        let now = tokio::time::Instant::now();
+        while self.sent.front().is_some_and(|t| now.duration_since(*t) >= window) {
+            self.sent.pop_front();
+        }
+        if self.sent.len() >= limit {
+            let until = self.sent[0] + window;
+            if until + IB_MIN_REQUEST_BUDGET > deadline {
+                return false;
+            }
+            tokio::time::sleep_until(until).await;
+            self.sent.pop_front();
+        }
+        self.sent.push_back(tokio::time::Instant::now());
+        true
+    }
+}
+
+/// Zeitlimit einer Anfrage: höchstens `max`, aber nie über das Restbudget hinaus.
+/// `None`, wenn das Restbudget für eine Anfrage nicht mehr reicht.
+fn request_timeout(remaining: Duration, max: Duration) -> Option<Duration> {
+    (remaining >= IB_MIN_REQUEST_BUDGET).then(|| remaining.min(max))
+}
+
+/// Nach einem Abbruch wegen des Zeitbudgets: bisherige Anleihen, die nicht mehr geprüft
+/// wurden, bleiben mit ihren gespeicherten Kursen im Korb, statt beim Speichern zu verschwinden.
+fn keep_unchecked(
+    chosen: &mut Vec<SelectedBond>,
+    prev: &[SelectedBond],
+    examined: &std::collections::BTreeSet<i32>,
+    stored: &BTreeMap<i32, StoredBond>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for b in prev {
+        if chosen.len() >= BONDS_PER_ISSUER {
+            break;
+        }
+        if examined.contains(&b.conid) || chosen.iter().any(|c| c.conid == b.conid) || !stored.contains_key(&b.conid) {
+            continue;
+        }
+        chosen.push(b.clone());
+        notes.push(format!("{} nicht geprüft (Zeitbudget), bisherige Kurse bleiben", b.description));
+    }
+    notes
+}
+
 /// Lädt Anleihelisten und Tageskurse von bis zu drei Anleihen je Emittent.
 /// Bekannte Anleihen bekommen nur den letzten Monat nach, neue erst eine Probe über
 /// einen Monat und dann ein volles Jahr.
@@ -414,11 +500,14 @@ pub async fn fetch_ib_bonds(
     };
     out.port = Some(port);
     let deadline = tokio::time::Instant::now() + IB_TOTAL_BUDGET;
+    let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut pacer = HistPacer::default();
     for iss in settings.issuers.iter().filter(|i| i.enabled) {
-        if tokio::time::Instant::now() >= deadline {
+        let Some(details_timeout) = request_timeout(remaining(), IB_DETAILS_TIMEOUT) else {
+            // Emittent bleibt unverändert: Ohne Eintrag in `selections` fasst das Speichern ihn nicht an
             out.errors.push(format!("IB {}: Zeitbudget des Abrufs erschöpft, nächster Versuch später", iss.key));
             continue;
-        }
+        };
         let query = Contract {
             symbol: iss.key.as_str().into(),
             security_type: SecurityType::Bond,
@@ -426,7 +515,7 @@ pub async fn fetch_ib_bonds(
             currency: "USD".into(),
             ..Default::default()
         };
-        let details = match tokio::time::timeout(IB_DETAILS_TIMEOUT, client.contract_details(&query)).await {
+        let details = match tokio::time::timeout(details_timeout, client.contract_details(&query)).await {
             Ok(Ok(list)) => list,
             Ok(Err(e)) => {
                 out.errors.push(format!("IB {}: Anleiheliste nicht abrufbar ({e})", iss.key));
@@ -438,8 +527,10 @@ pub async fn fetch_ib_bonds(
             }
         };
         let mut contracts: BTreeMap<i32, Contract> = BTreeMap::new();
+        // Wandelanleihen folgen der Aktie, nicht dem Kredit: nicht in den Korb
         let listings: Vec<BondListing> = details
             .iter()
+            .filter(|d| !d.convertible)
             .map(|d| {
                 let mut c = d.contract.clone();
                 c.exchange = "SMART".into();
@@ -456,19 +547,30 @@ pub async fn fetch_ib_bonds(
         let mut chosen = Vec::new();
         let mut skipped = Vec::new();
         let mut new_tries = 0usize;
+        let mut examined = std::collections::BTreeSet::new();
+        let mut aborted = false;
         for bond in &candidates {
-            if chosen.len() >= BONDS_PER_ISSUER || tokio::time::Instant::now() >= deadline {
+            if chosen.len() >= BONDS_PER_ISSUER {
                 break;
             }
             let Some(contract) = contracts.get(&bond.conid) else {
                 continue;
+            };
+            if !pacer.ready(deadline).await {
+                aborted = true;
+                break;
+            }
+            let Some(month_timeout) = request_timeout(remaining(), IB_MONTH_TIMEOUT) else {
+                aborted = true;
+                break;
             };
             let known = prev.iter().any(|b| b.conid == bond.conid)
                 .then(|| stored.get(&bond.conid))
                 .flatten()
                 .filter(|s| s.source == BOND_PRICE_SOURCE);
             if let Some(known) = known {
-                match fetch_bid_bars(&client, contract, 1.months(), IB_MONTH_TIMEOUT).await {
+                examined.insert(bond.conid);
+                match fetch_bid_bars(&client, contract, 1.months(), month_timeout).await {
                     Ok(prices) if !prices.is_empty() => {
                         out.histories.push(BondPriceHistory {
                             conid: bond.conid,
@@ -493,11 +595,17 @@ pub async fn fetch_ib_bonds(
                     break;
                 }
                 new_tries += 1;
-                let probe = fetch_bid_bars(&client, contract, 1.months(), IB_MONTH_TIMEOUT).await;
+                examined.insert(bond.conid);
+                let probe = fetch_bid_bars(&client, contract, 1.months(), month_timeout).await;
                 match probe {
                     Ok(p) if !p.is_empty() => {
                         tokio::time::sleep(IB_REQUEST_GAP).await;
-                        match fetch_bid_bars(&client, contract, 1.years(), IB_YEAR_TIMEOUT).await {
+                        let paced = pacer.ready(deadline).await;
+                        let Some(year_timeout) = request_timeout(remaining(), IB_YEAR_TIMEOUT).filter(|_| paced) else {
+                            aborted = true;
+                            break;
+                        };
+                        match fetch_bid_bars(&client, contract, 1.years(), year_timeout).await {
                             Ok(prices) if prices.len() >= MIN_HISTORY_BARS => {
                                 out.histories.push(BondPriceHistory {
                                     conid: bond.conid,
@@ -517,6 +625,10 @@ pub async fn fetch_ib_bonds(
             }
             tokio::time::sleep(IB_REQUEST_GAP).await;
         }
+        if aborted {
+            skipped.extend(keep_unchecked(&mut chosen, prev, &examined, stored));
+            out.errors.push(format!("IB {}: Zeitbudget erschöpft, Auswahl nur teilweise geprüft", iss.key));
+        }
         if chosen.is_empty() {
             let detail = if skipped.is_empty() { String::new() } else { format!(": {}", skipped.join(", ")) };
             out.errors.push(format!("IB {}: keine Anleihe mit ausreichender Kurshistorie{detail}", iss.key));
@@ -532,6 +644,40 @@ pub async fn fetch_ib_bonds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_timeouts_never_exceed_the_remaining_budget() {
+        assert_eq!(request_timeout(Duration::from_secs(600), IB_YEAR_TIMEOUT), Some(IB_YEAR_TIMEOUT));
+        assert_eq!(request_timeout(Duration::from_secs(40), IB_YEAR_TIMEOUT), Some(Duration::from_secs(40)));
+        assert_eq!(request_timeout(Duration::from_secs(4), IB_MONTH_TIMEOUT), None);
+    }
+
+    #[test]
+    fn an_aborted_run_keeps_unchecked_bonds_of_the_previous_basket() {
+        let bond = |conid: i32| SelectedBond {
+            conid,
+            description: format!("X {conid}"),
+            coupon_pct: 5.0,
+            maturity: NaiveDate::from_ymd_opt(2031, 1, 1).unwrap(),
+        };
+        let stored_bond = || StoredBond {
+            source: BOND_PRICE_SOURCE.into(),
+            last_date: NaiveDate::from_ymd_opt(2026, 11, 26).unwrap(),
+        };
+        let prev = vec![bond(1), bond(2), bond(3)];
+        // Nur Anleihe 1 wurde geprüft, 3 hat keine gespeicherten Kurse
+        let stored = BTreeMap::from([(1, stored_bond()), (2, stored_bond())]);
+        let examined = std::collections::BTreeSet::from([1]);
+        let mut chosen = vec![bond(1)];
+        let notes = keep_unchecked(&mut chosen, &prev, &examined, &stored);
+        assert_eq!(chosen.iter().map(|b| b.conid).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(notes.len(), 1);
+        // Geprüfte und verworfene Anleihen kommen nicht zurück
+        let mut chosen = Vec::new();
+        let examined = std::collections::BTreeSet::from([1, 2]);
+        keep_unchecked(&mut chosen, &prev, &examined, &stored);
+        assert!(chosen.is_empty());
+    }
 
     #[test]
     fn fred_csv_parsing_skips_gaps_and_checks_header() {
@@ -564,21 +710,27 @@ mod tests {
 
     #[test]
     fn client_ids_stay_in_own_range() {
-        for a in 0..5 {
-            let id = pick_client_id(0, a);
-            assert!((8300..=8399).contains(&id));
+        for seed in [0, 7, u32::MAX] {
+            let ids: Vec<i32> = (0..3).map(|a| pick_client_id(0, seed, a)).collect();
+            assert!(ids.iter().all(|id| (8300..=8399).contains(id)), "{ids:?}");
+            assert_ne!(ids[0], ids[1]);
         }
-        assert_eq!(pick_client_id(42, 1), 43);
+        // Fest eingestellte ID: nie eine fremde probieren
+        assert_eq!(pick_client_id(42, 5, 2), 42);
+        assert_eq!(socket_addr("::1", 7496), "[::1]:7496");
+        assert_eq!(socket_addr("127.0.0.1", 7496), "127.0.0.1:7496");
+        let too_big = CreditSettings { ib_client_id: IB_CLIENT_ID_MAX + 1, ..Default::default() };
+        assert!(too_big.validated().is_err());
     }
 
     #[test]
     fn series_lists_split_fred_and_treasury() {
         let fred = fred_series_ids();
         assert!(fred.contains(&"BAMLC0A4CBBB"));
-        assert_eq!(fred.len(), 2 + 7);
+        assert_eq!(fred.len(), 1 + 7);
         let all = all_credit_series_ids();
         assert!(all.contains(&"UST10Y"));
-        assert_eq!(all.len(), 2 + 7 + 11);
+        assert_eq!(all.len(), 1 + 7 + 11);
     }
 
     #[test]

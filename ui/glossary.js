@@ -38,7 +38,7 @@ export const GLOSSARY = {
   fsi: "Stressindex: Mittel aus Makroblock (robuste z-Werte der Hochzins-, CCC- und BBB-Aufschläge über drei Jahre) und KI-Block (Abstand zwischen Marktniveau und Agenturrating der Emittenten). Stress beginnt ab 1,0 und endet erst unter 0,5.",
   macroBlock: "Makroblock: Wie weit die Kreditaufschläge des gesamten US-Unternehmensanleihemarkts über ihrem üblichen Niveau der letzten drei Jahre liegen, in robusten Standardabweichungen.",
   aiBlock: "KI-Block: durchschnittlicher Abstand zwischen der Ratingstufe, die der Anleihemarkt den Emittenten einpreist, und ihrem Agenturrating. 1 Stufe entspricht etwa drei Notches.",
-  gSpread: "Spread: Rendite der Anleihen aus dem Geldkurs minus Rendite der US-Staatsanleihe gleicher Restlaufzeit, in Basispunkten. Bei mehreren Anleihen verkettet, damit Wechsel im Korb keine Sprünge erzeugen.",
+  gSpread: "Spread: Rendite der Anleihen aus dem Geldkurs minus Rendite der US-Staatsanleihe gleicher Restlaufzeit, in Basispunkten, gemittelt über die Anleihen im Korb. Die Veränderung über 30 Tage zählt nur Bewegungen einzelner Anleihen, damit ein Wechsel im Korb keinen Sprung erzeugt.",
   impliedRating: "Marktniveau: die Ratingstufe, deren durchschnittlicher Kreditaufschlag (ICE BofA OAS) dem Spread des Emittenten entspricht.",
   ratingGap: "Abstand: Marktniveau minus Agenturrating in Stufen. Positiv heißt: Der Anleihemarkt bewertet den Emittenten schlechter als die Ratingagentur.",
   oas: "OAS: optionsbereinigter Kreditaufschlag eines ICE-BofA-Anleiheindex über US-Staatsanleihen, in Prozentpunkten.",

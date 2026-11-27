@@ -97,12 +97,90 @@ fn bocpd_flags_a_mean_shift_quickly_and_stays_quiet_before() {
 }
 
 #[test]
-fn bocpd_warmup_is_masked() {
-    let xs = vec![0.1, f64::NAN, -0.2, 0.3, 5.0];
-    let mut p = bocpd_recent_break(&xs, 100.0, 7, 400);
-    mask_warmup(&mut p, &xs, 3);
-    assert!(p[0].is_nan() && p[1].is_nan() && p[2].is_nan());
-    assert!(p[3].is_finite() && p[4].is_finite());
+fn bocpd_needs_a_scale_and_masks_the_warmup() {
+    let mut xs: Vec<f64> = (0..16).map(|i| noise(i, 3)).collect();
+    xs[1] = f64::NAN;
+    let raw = bocpd_recent_break(&xs, 100.0, 7, 400);
+    // Ohne zehn vorherige gültige Beobachtungen gibt es keine Normierung
+    assert!(raw[..11].iter().all(|p| p.is_nan()), "{raw:?}");
+    assert!(raw[11..].iter().all(|p| p.is_finite()), "{raw:?}");
+    let mut p = raw.clone();
+    // Die 13. gültige Beobachtung steht wegen der Lücke an Index 13
+    mask_warmup(&mut p, &xs, 13);
+    assert!(p[..13].iter().all(|v| v.is_nan()));
+    assert!(p[13..].iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn bocpd_ignores_later_observations() {
+    let mut xs: Vec<f64> = (0..120).map(|i| noise(i, 11)).collect();
+    xs.extend((120..180).map(|i| 6.0 + 3.0 * noise(i, 11)));
+    let short = bocpd_recent_break(&xs[..100], 100.0, 7, 400);
+    let long = bocpd_recent_break(&xs, 100.0, 7, 400);
+    for (a, b) in short.iter().zip(&long) {
+        assert!((a.is_nan() && b.is_nan()) || (a - b).abs() < 1e-12, "{a} != {b}");
+    }
+}
+
+#[test]
+fn regime_history_does_not_change_with_later_data() {
+    let (inputs, today) = build(&Scenario { stress: late_stress, price: late_fall, spot: late_fall });
+    let cut = today - Duration::days(40);
+    let mut early = inputs.clone();
+    early.curve.retain(|c| c.date <= cut);
+    for s in early.oas.values_mut() {
+        s.retain(|d, _| *d <= cut);
+    }
+    let r_early = compute_regime(&early, cut);
+    let r_full = compute_regime(&inputs, today);
+    let full: BTreeMap<NaiveDate, &RegimeDay> = r_full.history.iter().map(|h| (h.date, h)).collect();
+    let mut compared = 0;
+    for h in &r_early.history {
+        let Some(f) = full.get(&h.date) else { continue };
+        assert_eq!(h.regime, f.regime, "{}", h.date);
+        assert_eq!(h.raw, f.raw, "{}", h.date);
+        assert_eq!(h.fsi.map(|v| (v * 1e9).round()), f.fsi.map(|v| (v * 1e9).round()), "{}", h.date);
+        let same = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (Some(x), Some(y)) => (x - y).abs() < 1e-9,
+            (None, None) => true,
+            _ => false,
+        };
+        assert!(same(h.price_break_prob, f.price_break_prob), "{}", h.date);
+        assert!(same(h.credit_break_prob, f.credit_break_prob), "{}", h.date);
+        compared += 1;
+    }
+    assert!(compared > 300, "{compared}");
+}
+
+#[test]
+fn a_data_gap_restarts_the_confirmation_count() {
+    // Kurvenlücke mitten in einem Wechsel: Der Kandidat muss danach neu zählen
+    let (mut inputs, today) = build(&Scenario { stress: late_stress, price: flat, spot: flat });
+    let r_full = compute_regime(&inputs, today);
+    let first_entk = r_full
+        .history
+        .iter()
+        .find(|h| h.raw == Regime::Entkoppelt)
+        .map(|h| h.date)
+        .expect("Szenario erzeugt Kreditstress");
+    let gap = first_entk + Duration::days(2);
+    inputs.curve.retain(|c| c.date != gap);
+    let r = compute_regime(&inputs, today);
+    let day = |d: NaiveDate| r.history.iter().find(|h| h.date == d).unwrap();
+    assert_eq!(day(gap).raw, Regime::Unbekannt);
+    // Zwei Tage vor der Lücke reichen zusammen mit einem Tag danach nicht für die Bestätigung
+    assert_ne!(day(gap + Duration::days(1)).regime, Regime::Entkoppelt);
+    assert_eq!(day(gap + Duration::days(3)).regime, Regime::Entkoppelt);
+}
+
+#[test]
+fn a_long_outage_does_not_show_an_old_regime_as_current() {
+    let (mut inputs, today) = build(&Scenario { stress: calm, price: flat, spot: flat });
+    inputs.curve.retain(|c| c.date <= today - Duration::days(10));
+    let r = compute_regime(&inputs, today);
+    assert_eq!(r.regime, Regime::Unbekannt);
+    assert_eq!(r.classified_until, Some(today - Duration::days(10)));
+    assert!(r.notes.iter().any(|n| n.contains("Zuletzt bestätigt: Ruhig")), "{:?}", r.notes);
 }
 
 #[test]
@@ -328,6 +406,7 @@ fn issuer_gap_feeds_the_ai_block() {
         key: "X".into(),
         label: "X".into(),
         agency_rating: "BBB".into(),
+        linked_bp: spreads.clone(),
         spreads_bp: spreads,
         bonds: vec![],
     });
@@ -336,4 +415,70 @@ fn issuer_gap_feeds_the_ai_block() {
     assert_eq!(iss.implied_bucket.as_deref(), Some("B"), "{iss:?}");
     assert!(iss.gap_buckets.unwrap() > 1.5, "{iss:?}");
     assert!(r.ai_block.unwrap() > 1.5);
+}
+
+#[test]
+fn a_missing_curve_day_keeps_the_falling_state() {
+    assert!(next_falling_state(true, &FallSignal::default()));
+    assert!(!next_falling_state(false, &FallSignal::default()));
+}
+
+#[test]
+fn fsi_changes_skip_carried_days_and_composition_changes() {
+    let day = |fsi: f64, composition: u64, data_stamp: u64| StressDay {
+        fsi: Some(fsi),
+        composition,
+        data_stamp,
+        ..Default::default()
+    };
+    let fri = day(1.0, 0b111, 1);
+    let sat = day(1.0, 0b111, 1);
+    let mon = day(1.4, 0b111, 2);
+    let with_ai = day(2.0, 0b1111, 3);
+    assert_eq!(sat.fsi_change_since(&fri, true), None, "Wochenende ohne neue Daten");
+    assert!((mon.fsi_change_since(&sat, true).unwrap() - 0.4).abs() < 1e-12);
+    assert_eq!(with_ai.fsi_change_since(&mon, true), None, "KI-Block kommt hinzu");
+    // Für die 7-Tage-Kopplung zählt nur die Zusammensetzung
+    assert!(sat.fsi_change_since(&fri, false).is_some());
+}
+
+#[test]
+fn implied_position_is_continuous_with_an_inverted_grid() {
+    // AAA zeitweise über AA
+    let grid = [Some(55.0), Some(45.0), Some(70.0), Some(110.0), Some(190.0), Some(330.0), Some(800.0)];
+    let below = implied_position(54.9, &grid).unwrap();
+    let above = implied_position(55.1, &grid).unwrap();
+    assert!((above - below).abs() < 0.05, "{below} vs {above}");
+    // Oberer Rand invertiert: weite Spreads bekommen trotzdem eine Position
+    let top = [Some(40.0), Some(60.0), Some(90.0), Some(140.0), Some(250.0), Some(500.0), Some(450.0)];
+    assert!(implied_position(1500.0, &top).unwrap() > 6.0);
+}
+
+#[test]
+fn the_first_regime_needs_no_confirmation() {
+    let (inputs, today) = build(&Scenario { stress: calm, price: flat, spot: flat });
+    let r = compute_regime(&inputs, today);
+    let first_raw = r.history.iter().find(|h| h.raw != Regime::Unbekannt).unwrap();
+    assert_eq!(first_raw.regime, Regime::Ruhig, "{}", first_raw.date);
+}
+
+#[test]
+fn distress_alone_is_a_hint_not_an_early_warning() {
+    let (mut inputs, today) = build(&Scenario { stress: late_stress, price: flat, spot: flat });
+    let mut spreads = Series::new();
+    for i in 0..120 {
+        spreads.insert(today - Duration::days(i), 3000.0);
+    }
+    inputs.issuers.push(IssuerSeries {
+        key: "X".into(),
+        label: "X".into(),
+        agency_rating: "B".into(),
+        linked_bp: spreads.clone(),
+        spreads_bp: spreads,
+        bonds: vec![],
+    });
+    let r = compute_regime(&inputs, today);
+    assert_eq!(r.regime, Regime::Entkoppelt);
+    assert!(r.warnings.iter().any(|w| w.contains("Notlagenbereich")), "{:?}", r.warnings);
+    assert!(!r.early_warning);
 }

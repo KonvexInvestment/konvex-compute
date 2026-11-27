@@ -6,11 +6,13 @@ use crate::credit_fetch::{all_credit_series_ids, CreditSettings, IbFetchOutcome,
 use crate::regime::{CurveDay, CurveNode, IssuerSeries, ModelInputs, Series};
 use crate::store::ComputeStore;
 use chrono::NaiveDate;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
 const SETTINGS_KEY: &str = "credit_settings";
+/// Untergrenze beim Laden: vor allen Daten, die die Software speichern kann.
+const EARLIEST: NaiveDate = NaiveDate::from_ymd_opt(1990, 1, 1).unwrap();
 
 /// Nur die Felder eines gespeicherten Verfalls, die das Modell braucht.
 #[derive(Deserialize)]
@@ -51,9 +53,29 @@ impl ComputeStore {
             .unwrap_or_default()
     }
 
+    /// Speichert die Einstellungen. Anleihen und Kurse entfernter Emittenten werden gelöscht;
+    /// ausgeschaltete Emittenten behalten ihre Daten für ein späteres Wiedereinschalten.
     pub fn save_credit_settings(&self, settings: &CreditSettings) -> Result<(), String> {
         let json = serde_json::to_string(settings).map_err(|e| format!("Einstellungen: {e}"))?;
-        self.set_meta(SETTINGS_KEY, &json)
+        self.set_meta(SETTINGS_KEY, &json)?;
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("credit_bonds: {e}"))?;
+        let stored: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT DISTINCT issuer FROM credit_bonds")
+                .map_err(|e| format!("credit_bonds: {e}"))?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| format!("credit_bonds: {e}"))?;
+            rows.flatten().collect()
+        };
+        for issuer in stored.iter().filter(|k| !settings.issuers.iter().any(|i| &i.key == *k)) {
+            tx.execute("DELETE FROM credit_bonds WHERE issuer = ?1", params![issuer])
+                .map_err(|e| format!("credit_bonds: {e}"))?;
+        }
+        tx.execute("DELETE FROM bond_prices WHERE conid NOT IN (SELECT conid FROM credit_bonds)", [])
+            .map_err(|e| format!("bond_prices: {e}"))?;
+        tx.commit().map_err(|e| format!("credit_bonds: {e}"))
     }
 
     pub fn latest_credit_date(&self, series_id: &str) -> Result<Option<NaiveDate>, String> {
@@ -90,7 +112,10 @@ impl ComputeStore {
     }
 
     pub fn load_credit_series(&self, ids: &[&str], from: NaiveDate) -> Result<BTreeMap<String, Series>, String> {
-        let conn = self.connect()?;
+        Self::load_credit_series_in(&self.connect()?, ids, from)
+    }
+
+    fn load_credit_series_in(conn: &Connection, ids: &[&str], from: NaiveDate) -> Result<BTreeMap<String, Series>, String> {
         let mut stmt = conn
             .prepare("SELECT date_iso, value FROM credit_series WHERE series_id = ?1 AND date_iso >= ?2 ORDER BY date_iso")
             .map_err(|e| format!("credit_series: {e}"))?;
@@ -163,7 +188,10 @@ impl ComputeStore {
     }
 
     pub fn load_bond_selection(&self) -> Result<BTreeMap<String, Vec<SelectedBond>>, String> {
-        let conn = self.connect()?;
+        Self::load_bond_selection_in(&self.connect()?)
+    }
+
+    fn load_bond_selection_in(conn: &Connection) -> Result<BTreeMap<String, Vec<SelectedBond>>, String> {
         let mut stmt = conn
             .prepare("SELECT issuer, conid, description, coupon, maturity FROM credit_bonds ORDER BY issuer, maturity")
             .map_err(|e| format!("credit_bonds: {e}"))?;
@@ -209,7 +237,10 @@ impl ComputeStore {
 
     /// Tageskurse und Kursquelle je Anleihe.
     pub fn load_bond_prices(&self, conids: &[i32]) -> Result<BTreeMap<i32, (Series, String)>, String> {
-        let conn = self.connect()?;
+        Self::load_bond_prices_in(&self.connect()?, conids)
+    }
+
+    fn load_bond_prices_in(conn: &Connection, conids: &[i32]) -> Result<BTreeMap<i32, (Series, String)>, String> {
         let mut stmt = conn
             .prepare("SELECT date_iso, price, source FROM bond_prices WHERE conid = ?1 ORDER BY date_iso")
             .map_err(|e| format!("bond_prices: {e}"))?;
@@ -237,14 +268,26 @@ impl ComputeStore {
 
     /// Ein Kurvenstand je Tag ab `from`: der letzte Live-Snapshot, sonst der rekonstruierte Tag.
     pub fn load_curve_days(&self, gpu: &str, from: NaiveDate) -> Result<Vec<CurveDay>, String> {
-        let conn = self.connect()?;
+        Self::load_curve_days_in(&self.connect()?, gpu, from)
+    }
+
+    fn load_curve_days_in(conn: &Connection, gpu: &str, from: NaiveDate) -> Result<Vec<CurveDay>, String> {
+        // Nur eine Zeile je Tag aus SQLite holen (live vor Backfill, dann die neueste), statt alle
+        // 15-Minuten-Stände der letzten 48 Stunden samt Kurven-JSON zu laden.
         let mut stmt = conn
             .prepare(
-                "SELECT snapshot_date, spot_price, expiries_json FROM curve_snapshots
-                 WHERE gpu = ?1 AND snapshot_date >= ?2
-                 ORDER BY snapshot_date,
-                          CASE snapshot_kind WHEN 'live' THEN 1 ELSE 0 END,
-                          captured_at, id",
+                "SELECT snapshot_date, spot_price, expiries_json FROM (
+                     SELECT snapshot_date, spot_price, expiries_json,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY snapshot_date
+                                ORDER BY CASE snapshot_kind WHEN 'live' THEN 1 ELSE 0 END DESC,
+                                         captured_at DESC, id DESC
+                            ) AS rn
+                     FROM curve_snapshots
+                     WHERE gpu = ?1 AND snapshot_date >= ?2
+                 )
+                 WHERE rn = 1
+                 ORDER BY snapshot_date",
             )
             .map_err(|e| format!("curve_snapshots: {e}"))?;
         let rows = stmt
@@ -256,7 +299,6 @@ impl ComputeStore {
                 ))
             })
             .map_err(|e| format!("curve_snapshots: {e}"))?;
-        // Spätere Zeilen desselben Tages überschreiben frühere (live nach Backfill, neueste zuletzt)
         let mut by_day: BTreeMap<NaiveDate, (Option<f64>, String)> = BTreeMap::new();
         for (d, spot, json) in rows.flatten() {
             if let Some(d) = parse_date(&d) {
@@ -285,20 +327,26 @@ impl ComputeStore {
         &self,
         gpu: &str,
         settings: &CreditSettings,
-        today: NaiveDate,
     ) -> Result<(ModelInputs, Vec<IssuerBondInfo>), String> {
-        let credit_from = today - chrono::Duration::days(crate::credit_fetch::FRED_HISTORY_DAYS + 30);
-        let all = self.load_credit_series(&all_credit_series_ids(), credit_from)?;
+        // Eine gemeinsame Lesetransaktion: Ein parallel gespeicherter IB-Abruf kann sonst
+        // zwischen Auswahl und Kursen liegen und Anleihen ohne Kurse hinterlassen.
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|e| format!("Lesetransaktion: {e}"))?;
+        // Alles Gespeicherte laden: Der Modellstart hängt dann nur an den Daten, nicht am Datum
+        // des Laufs, und frühere Tageswerte bleiben bei späteren Läufen gleich.
+        let all = Self::load_credit_series_in(&tx, &all_credit_series_ids(), EARLIEST)?;
         let (treasury, oas): (BTreeMap<String, Series>, BTreeMap<String, Series>) =
             all.into_iter().partition(|(k, _)| is_treasury_series(k));
 
-        let selection = self.load_bond_selection()?;
+        let selection = Self::load_bond_selection_in(&tx)?;
         let mut issuers = Vec::new();
         let mut infos = Vec::new();
         for iss in settings.issuers.iter().filter(|i| i.enabled) {
             let bonds = selection.get(&iss.key).cloned().unwrap_or_default();
             let conids: Vec<i32> = bonds.iter().map(|b| b.conid).collect();
-            let prices = self.load_bond_prices(&conids)?;
+            let prices = Self::load_bond_prices_in(&tx, &conids)?;
             let price_series: BTreeMap<i32, Series> = prices.iter().map(|(k, (s, _))| (*k, s.clone())).collect();
             let spreads = issuer_spread_series(&bonds, &price_series, &treasury);
             for b in &bonds {
@@ -319,13 +367,14 @@ impl ComputeStore {
                 key: iss.key.clone(),
                 label: iss.label.clone(),
                 agency_rating: iss.agency_rating.clone(),
-                spreads_bp: spreads,
+                spreads_bp: spreads.level,
+                linked_bp: spreads.linked,
                 bonds: bonds.iter().map(|b| b.description.clone()).collect(),
             });
         }
 
-        let curve_from = today - chrono::Duration::days(800);
-        let curve = self.load_curve_days(gpu, curve_from)?;
+        let curve = Self::load_curve_days_in(&tx, gpu, EARLIEST)?;
+        drop(tx);
         Ok((
             ModelInputs {
                 gpu: gpu.to_string(),
@@ -434,5 +483,33 @@ mod tests {
         };
         store.save_credit_settings(&s).unwrap();
         assert_eq!(store.load_credit_settings().ib_port, 7497);
+    }
+
+    #[test]
+    fn curve_days_take_the_latest_live_snapshot_per_day() {
+        let store = temp_store("curve-days");
+        let conn = store.connect().unwrap();
+        let json = |median: f64| format!(r#"[{{"delivery_date":"2027-01-31","median":{median},"p25":{}}}]"#, median * 0.9);
+        let rows = [
+            ("2026-11-20T23:00:00Z", "2026-11-20", "daily_backfill", 1.0, json(2.0)),
+            ("2026-11-20T10:00:00Z", "2026-11-20", "live", 1.5, json(2.1)),
+            ("2026-11-20T12:00:00Z", "2026-11-20", "live", 1.7, json(2.2)),
+            ("2026-11-21T23:00:00Z", "2026-11-21", "daily_backfill", 3.0, json(2.3)),
+        ];
+        for (captured, day, kind, spot, body) in rows {
+            conn.execute(
+                "INSERT INTO curve_snapshots (
+                    captured_at, snapshot_date, snapshot_kind, gpu, spot_price,
+                    total_liquidity, total_volume_24h, total_volume_total, expiry_count, expiries_json
+                ) VALUES (?1, ?2, ?3, 'H100', ?4, 0, 0, 0, 1, ?5)",
+                params![captured, day, kind, spot, body],
+            )
+            .unwrap();
+        }
+        let days = store.load_curve_days("H100", d(2026, 11, 1)).unwrap();
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[0].spot, Some(1.7));
+        assert_eq!(days[0].nodes[0].median, Some(2.2));
+        assert_eq!(days[1].spot, Some(3.0));
     }
 }
