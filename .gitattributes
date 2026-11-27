@@ -1,0 +1,6 @@
+# Vom Tauri-Build erzeugte Dateien schreibt tauri-build immer mit LF. Ohne diese Regel
+# gelten sie unter Windows (core.autocrlf=true) nach jedem Build als geändert.
+src-tauri/gen/** text eol=lf
+
+# Shell-Skripte brauchen LF, auch wenn sie unter Windows ausgecheckt werden
+*.sh text eol=lf

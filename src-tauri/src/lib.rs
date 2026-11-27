@@ -334,6 +334,19 @@ pub fn run() {
         }))
         .manage(app_state)
         .setup(move |app| {
+            // Fallback: Das Fenster startet unsichtbar und wird vom Frontend nach setTheme gezeigt.
+            // Scheitert das (z. B. Skriptfehler), erscheint es hier spätestens nach 3 Sekunden.
+            let show_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if let Some(win) = show_handle.get_webview_window("main") {
+                    if !win.is_visible().unwrap_or(true) {
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
+                }
+            });
+
             let handle = app.handle().clone();
             let state = Arc::clone(&bg_state);
             let _ = state.app_handle.set(handle.clone());

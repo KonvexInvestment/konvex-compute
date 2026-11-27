@@ -1225,13 +1225,21 @@ function setupEvents() {
 
   // Theme-Schalter (Konvex Dark Standard + Light Theme)
   // Native Fensterleiste mitziehen (Windows-Titelleiste, macOS-Fensterdarstellung)
-  const syncWindowTheme = (theme) => {
-    const win = window.__TAURI__?.window?.getCurrentWindow?.();
-    win?.setTheme?.(theme)?.catch?.(() => {});
-  };
+  const currentWindow = () => window.__TAURI__?.window?.getCurrentWindow?.();
+  const syncWindowTheme = (theme) => Promise.resolve(currentWindow()?.setTheme?.(theme)).catch(() => {});
   const savedTheme = localStorage.getItem("konvex-compute-theme") || "dark";
   document.documentElement.dataset.theme = savedTheme;
-  syncWindowTheme(savedTheme);
+  // Das Fenster startet unsichtbar (tauri.conf.json) und erscheint erst mit passendem Farbschema:
+  // Unter Windows zeichnet ein setTheme auf das schon sichtbare Fenster die Titelleiste nicht neu.
+  syncWindowTheme(savedTheme).finally(async () => {
+    const win = currentWindow();
+    try {
+      await win?.show?.();
+      await win?.setFocus?.();
+    } catch {
+      // Rust zeigt das Fenster spätestens nach 3 s selbst
+    }
+  });
   els.themeToggle.textContent = savedTheme === "dark" ? "Hell" : "Dunkel";
   els.themeToggle.addEventListener("click", () => {
     const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
