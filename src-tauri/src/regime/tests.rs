@@ -89,7 +89,7 @@ fn implied_position_interpolates_logarithmically() {
 fn bocpd_flags_a_mean_shift_quickly_and_stays_quiet_before() {
     let mut xs: Vec<f64> = (0..200).map(|i| noise(i, 7)).collect();
     xs.extend((200..260).map(|i| 4.0 + noise(i, 7)));
-    let p = bocpd_recent_break(&xs, 100.0, 7, 400);
+    let p = bocpd_recent_break(&xs, 100.0, 7, 400, 0.0);
     let quiet_max = p[30..195].iter().copied().fold(0.0, f64::max);
     assert!(quiet_max < 0.5, "Fehlalarm vor dem Bruch: {quiet_max}");
     let after_max = p[200..207].iter().copied().fold(0.0, f64::max);
@@ -100,7 +100,7 @@ fn bocpd_flags_a_mean_shift_quickly_and_stays_quiet_before() {
 fn bocpd_needs_a_scale_and_masks_the_warmup() {
     let mut xs: Vec<f64> = (0..16).map(|i| noise(i, 3)).collect();
     xs[1] = f64::NAN;
-    let raw = bocpd_recent_break(&xs, 100.0, 7, 400);
+    let raw = bocpd_recent_break(&xs, 100.0, 7, 400, 0.0);
     // Ohne zehn vorherige gültige Beobachtungen gibt es keine Normierung
     assert!(raw[..11].iter().all(|p| p.is_nan()), "{raw:?}");
     assert!(raw[11..].iter().all(|p| p.is_finite()), "{raw:?}");
@@ -115,8 +115,8 @@ fn bocpd_needs_a_scale_and_masks_the_warmup() {
 fn bocpd_ignores_later_observations() {
     let mut xs: Vec<f64> = (0..120).map(|i| noise(i, 11)).collect();
     xs.extend((120..180).map(|i| 6.0 + 3.0 * noise(i, 11)));
-    let short = bocpd_recent_break(&xs[..100], 100.0, 7, 400);
-    let long = bocpd_recent_break(&xs, 100.0, 7, 400);
+    let short = bocpd_recent_break(&xs[..100], 100.0, 7, 400, 0.0);
+    let long = bocpd_recent_break(&xs, 100.0, 7, 400, 0.0);
     for (a, b) in short.iter().zip(&long) {
         assert!((a.is_nan() && b.is_nan()) || (a - b).abs() < 1e-12, "{a} != {b}");
     }
@@ -563,4 +563,24 @@ fn a_basket_change_is_no_credit_move() {
     // Neue Anleihe im Korb: derselbe Sprung zählt nicht als Bewegung
     let switched = change_at_switch(spreads.keys().map(|d| (*d, if *d < switch { 1 } else { 2 })).collect());
     assert_eq!(switched, None);
+}
+
+#[test]
+fn after_a_flat_phase_a_tick_is_no_break_but_a_jump_is() {
+    let mut xs = vec![0.0; 40];
+    xs.push(1e-4);
+    let tick = bocpd_recent_break(&xs, 100.0, 7, 400, BOCPD_MIN_SCALE_PRICE);
+    assert!(*tick.last().unwrap() < 0.5, "{:?}", tick.last());
+    xs.pop();
+    xs.push(0.05);
+    let jump = bocpd_recent_break(&xs, 100.0, 7, 400, BOCPD_MIN_SCALE_PRICE);
+    assert!(*jump.last().unwrap() > 0.5, "{:?}", jump.last());
+}
+
+#[test]
+fn hysteresis_restarts_after_a_long_gap() {
+    let day = d0();
+    assert!(!gap_exceeds(None, day, REGIME_STALE_DAYS));
+    assert!(!gap_exceeds(Some(day - Duration::days(3)), day, REGIME_STALE_DAYS));
+    assert!(gap_exceeds(Some(day - Duration::days(4)), day, REGIME_STALE_DAYS));
 }

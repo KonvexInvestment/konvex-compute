@@ -38,6 +38,8 @@ const AUTO_BACKFILL_MIN_AGE_HOURS: i64 = 20;
 const SCHEDULER_TICK_SECS: u64 = 30;
 /// Kredit- und Anleihedaten ändern sich täglich: Abruf höchstens alle sechs Stunden.
 const CREDIT_REFRESH_HOURS: i64 = 6;
+/// Abstand automatischer IB-Versuche nach einem Lauf ohne neue Kurse (Stunden).
+const IB_RETRY_HOURS: i64 = 2;
 /// Ältester Tag der Zinskurve, der noch als aktueller Abruf gilt (Feiertage, lange Wochenenden).
 const TREASURY_MAX_AGE_DAYS: i64 = 7;
 /// Nach einem Fehlschlag frühestens nach dieser Zeit erneut versuchen.
@@ -127,6 +129,9 @@ pub struct AppState {
     /// Serialisiert Lesen+Senden der Busy-Flags: Da jede Flag-Änderung ein Event auslöst,
     /// trägt so das zuletzt gesendete Event immer den aktuellen Stand.
     busy_emit_lock: std::sync::Mutex<()>,
+    /// Serialisiert Lesen und Senden des Kreditstatus, damit ein älteres Ende-Event nie nach
+    /// dem Start-Event eines neuen Laufs ankommt.
+    credit_emit_lock: std::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -149,6 +154,7 @@ impl AppState {
             next_auto_refresh_ts: AtomicI64::new(0),
             app_handle: OnceLock::new(),
             busy_emit_lock: std::sync::Mutex::new(()),
+            credit_emit_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -301,12 +307,14 @@ impl AppState {
         }
 
         let settings = self.store.load_credit_settings();
+        let meta = |k: &str| self.store.get_meta(k).ok().flatten();
+        // Automatisch höchstens alle CREDIT_REFRESH_HOURS nach einem Erfolg und alle
+        // IB_RETRY_HOURS nach einem Versuch; ein Klick fragt immer ab.
         let ib_due = manual
-            || is_older_than(
-                self.store.get_meta("ib_last_success_at").ok().flatten().as_deref(),
-                chrono::Duration::hours(CREDIT_REFRESH_HOURS),
-            );
+            || (is_older_than(meta("ib_last_success_at").as_deref(), chrono::Duration::hours(CREDIT_REFRESH_HOURS))
+                && is_older_than(meta("ib_last_attempt_at").as_deref(), chrono::Duration::hours(IB_RETRY_HOURS)));
         if settings.ib_enabled && ib_due {
+            let _ = self.store.set_meta("ib_last_attempt_at", &now_s);
             let previous = self.store.load_bond_selection().unwrap_or_default();
             let stored = self.store.load_stored_bonds().unwrap_or_default();
             let outcome = fetch_ib_bonds(&settings, &previous, &stored, today).await;
@@ -339,7 +347,9 @@ impl AppState {
             let _ = self.store.set_meta("ib_last_status", "IB-Abruf ausgeschaltet");
         }
 
-        let _ = self.store.set_meta("credit_last_attempt_at", &now_s);
+        // Versuch mit dem Endzeitpunkt: Nach einem langen Lauf beginnt der Wiederholungsabstand erst jetzt
+        let end_s = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let _ = self.store.set_meta("credit_last_attempt_at", &end_s);
         // Erfolg nur, wenn Zinskurve und alle OAS-Reihen da sind; sonst neuer Versuch nach
         // CREDIT_RETRY_MIN statt erst nach CREDIT_REFRESH_HOURS.
         if fred_ok == fred_ids.len() && treasury_ok {
@@ -350,6 +360,8 @@ impl AppState {
             &serde_json::to_string(&errors).unwrap_or_else(|_| "[]".into()),
         );
         self.crediting.store(false, Ordering::Relaxed);
+        // Rückgabe noch unter der Sperre: Sie beschreibt diesen Lauf, nicht einen danach gestarteten
+        let result = self.credit_status();
         // Erst die Sperre freigeben, dann das Ende melden: Ein Klick nach dem Ende-Event
         // bekommt so nie mehr „läuft bereits“.
         drop(guard);
@@ -360,10 +372,11 @@ impl AppState {
                 errors.first().map(String::as_str).unwrap_or("")
             ));
         }
-        Ok(self.credit_status())
+        Ok(result)
     }
 
     fn emit_credit(&self) {
+        let _serial = self.credit_emit_lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(handle) = self.app_handle.get() {
             let _ = handle.emit("compute:credit", self.credit_status());
         }

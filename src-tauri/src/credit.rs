@@ -444,8 +444,11 @@ pub fn linked_changes(bonds: &[BondSpreads]) -> BTreeMap<NaiveDate, f64> {
     out.insert(*first, level);
     for w in dates.windows(2) {
         let (d0, d1) = (w[0], w[1]);
+        // Nur Bewegungen innerhalb desselben Korbzeitraums: Ein Wiedereintritt verkettet nicht
+        // den Spread vor dem Austritt mit dem danach.
         let moves: Vec<f64> = bonds
             .iter()
+            .filter(|b| b.interval_start(d0) == b.interval_start(d1))
             .filter_map(|b| Some(b.carried(d1)? - b.carried(d0)?))
             .collect();
         if !moves.is_empty() {
@@ -673,6 +676,13 @@ mod tests {
         );
         assert_eq!(back.carried(d(2026, 11, 5)), None);
         assert_eq!(back.carried(d(2026, 11, 9)), Some(410.0));
+        // Ohne anderen Spreadtag dazwischen wird der Wiedereintritt nicht als Bewegung verkettet
+        let back = BondSpreads::new(
+            3,
+            pts(&[(2, 400.0), (5, 450.0)]),
+            vec![(d(2026, 11, 1), Some(d(2026, 11, 3))), (d(2026, 11, 5), None)],
+        );
+        assert_eq!(linked_changes(&[back])[&d(2026, 11, 5)], 0.0);
     }
 
     #[test]

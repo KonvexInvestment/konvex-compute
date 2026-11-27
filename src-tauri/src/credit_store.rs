@@ -29,25 +29,32 @@ fn iso(d: NaiveDate) -> String {
 /// Überführt den Korb aus der ersten Fassung (ohne Gültigkeit) in `credit_basket`:
 /// Die bisherigen Anleihen gelten als erster Korb über die ganze Historie.
 pub(crate) fn migrate_credit_tables(conn: &Connection) -> Result<(), String> {
-    let old: bool = conn
-        .query_row(
+    let err = |e: rusqlite::Error| format!("Migration credit_bonds: {e}");
+    // Prüfen erst unter der Schreibsperre: Zwei gleichzeitige Starts migrieren so nur einmal
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(err)?;
+    let run = || -> Result<(), rusqlite::Error> {
+        let old: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'credit_bonds')",
             [],
             |r| r.get(0),
-        )
-        .map_err(|e| format!("Migration credit_bonds: {e}"))?;
-    if old {
-        conn.execute_batch(&format!(
-            "BEGIN IMMEDIATE;
-             INSERT OR IGNORE INTO credit_basket (issuer, conid, description, coupon, maturity, valid_from, valid_to)
-                 SELECT issuer, conid, description, coupon, maturity, '{}', NULL FROM credit_bonds;
-             DROP TABLE credit_bonds;
-             COMMIT;",
-            iso(EARLIEST)
-        ))
-        .map_err(|e| format!("Migration credit_bonds: {e}"))?;
+        )?;
+        if old {
+            conn.execute(
+                "INSERT OR IGNORE INTO credit_basket (issuer, conid, description, coupon, maturity, valid_from, valid_to)
+                 SELECT issuer, conid, description, coupon, maturity, ?1, NULL FROM credit_bonds",
+                params![iso(EARLIEST)],
+            )?;
+            conn.execute_batch("DROP TABLE credit_bonds")?;
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(err),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err(e))
+        }
     }
-    Ok(())
 }
 
 fn parse_date(s: &str) -> Option<NaiveDate> {
@@ -280,6 +287,17 @@ impl ComputeStore {
             written.extend(bonds.iter().map(|b| b.conid));
         }
         for h in outcome.histories.iter().filter(|h| written.contains(&h.conid)) {
+            // Kurse in abgeschlossenen Korbzeiträumen sind schon in frühere Tageswerte eingegangen
+            // und bleiben unverändert, auch wenn ein Wiedereintritt eine volle Historie bringt.
+            let closed: Vec<(NaiveDate, NaiveDate)> = {
+                let mut stmt = tx
+                    .prepare("SELECT valid_from, valid_to FROM credit_basket WHERE conid = ?1 AND valid_to IS NOT NULL")
+                    .map_err(|e| format!("credit_basket: {e}"))?;
+                let rows = stmt
+                    .query_map(params![h.conid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(|e| format!("credit_basket: {e}"))?;
+                rows.flatten().filter_map(|(f, t)| Some((parse_date(&f)?, parse_date(&t)?))).collect()
+            };
             let stored_source: Option<String> = tx
                 .query_row("SELECT source FROM bond_prices WHERE conid = ?1 LIMIT 1", params![h.conid], |r| r.get(0))
                 .optional()
@@ -296,12 +314,15 @@ impl ComputeStore {
                     .map_err(|e| format!("bond_prices: {e}"))?;
             }
             for (d, p) in &h.prices {
-                tx.execute(
+                let sql = if same_source && closed.iter().any(|(f, t)| d >= f && d <= t) {
                     "INSERT INTO bond_prices (conid, date_iso, price, source) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(conid, date_iso) DO UPDATE SET price = excluded.price, source = excluded.source",
-                    params![h.conid, iso(*d), p, h.source],
-                )
-                .map_err(|e| format!("bond_prices: {e}"))?;
+                     ON CONFLICT(conid, date_iso) DO NOTHING"
+                } else {
+                    "INSERT INTO bond_prices (conid, date_iso, price, source) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(conid, date_iso) DO UPDATE SET price = excluded.price, source = excluded.source"
+                };
+                tx.execute(sql, params![h.conid, iso(*d), p, h.source])
+                    .map_err(|e| format!("bond_prices: {e}"))?;
                 rows += 1;
             }
         }
@@ -684,6 +705,18 @@ mod tests {
         assert_eq!(of(3), vec![(d(2026, 11, 22), None)]);
         let stored = store.load_stored_bonds().unwrap();
         assert_eq!(stored[&1].last_date, d(2026, 11, 22));
+
+        // Wiedereintritt von Anleihe 2 mit voller Historie: Kurse im alten Zeitraum bleiben
+        let mut back = IbFetchOutcome::default();
+        back.selections.insert("XYZ".into(), vec![bond(1, 31), bond(2, 33), bond(3, 34)]);
+        back.histories.push(hist(2, "bid", vec![(d(2026, 11, 20), 90.0), (d(2026, 11, 24), 96.0)], true));
+        store.save_ib_outcome(&back, d(2026, 11, 24)).unwrap();
+        let p2 = &store.load_bond_prices(&[2]).unwrap()[&2].0;
+        assert_eq!(p2[&d(2026, 11, 20)], 97.0);
+        assert_eq!(p2[&d(2026, 11, 24)], 96.0);
+        let basket = ComputeStore::load_basket_in(&store.connect().unwrap()).unwrap();
+        let of2 = basket["XYZ"].iter().find(|b| b.bond.conid == 2).unwrap().active.clone();
+        assert_eq!(of2, vec![(EARLIEST, Some(d(2026, 11, 21))), (d(2026, 11, 24), None)]);
     }
 
     #[test]

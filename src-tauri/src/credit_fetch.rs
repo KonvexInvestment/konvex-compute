@@ -285,13 +285,22 @@ pub async fn fetch_treasury_curve(
         let url = format!(
             "{TREASURY_CSV}/{year}/all?type=daily_treasury_yield_curve&field_tdr_date_value={year}&page&_format=csv"
         );
-        // HTTP- und Formatfehler zählen immer. Nur eine leere Datei des neuen Jahres in den
-        // ersten Januartagen heißt „noch keine Zeilen“; dann zählen die Vorjahre.
+        // HTTP- und Formatfehler zählen immer. Nur die Datei des neuen Jahres darf in den ersten
+        // Januartagen leer sein; eine leere Datei eines anderen Jahres hinterließe sonst eine
+        // Lücke, die spätere Abrufe (ab dem letzten gespeicherten Tag) nie mehr füllen.
+        let grace = year == today.year() && today.ordinal() <= TREASURY_NEW_YEAR_GRACE_DAYS;
         let body = get_text_with_retry(client, &url, &format!("Treasury.gov {year}")).await?;
-        if body.trim().is_empty() && year == today.year() && today.ordinal() <= TREASURY_NEW_YEAR_GRACE_DAYS {
+        if body.trim().is_empty() && grace {
             continue;
         }
-        for (id, pts) in parse_treasury_csv(&body)? {
+        let curve = parse_treasury_csv(&body)?;
+        if curve.values().all(|v| v.is_empty()) {
+            if grace {
+                continue;
+            }
+            return Err(format!("Treasury.gov {year}: keine Renditen in der Jahresdatei"));
+        }
+        for (id, pts) in curve {
             out.entry(id).or_default().extend(pts.into_iter().filter(|(d, _)| *d >= from));
         }
     }
@@ -416,9 +425,17 @@ async fn fetch_bid_bars(
             .iter()
             .filter_map(|b| Some((bar_date(b)?, b.close)).filter(|(_, p)| plausible_price(*p)))
             .collect()),
+        // „Keine Daten“ ist eine endgültige Antwort, kein Verbindungs- oder Pacing-Fehler
+        Ok(Err(ibapi::Error::Notice(n))) if is_no_data_notice(n.code, &n.message) => Ok(Vec::new()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("keine Antwort".into()),
     }
+}
+
+/// IB-Meldung 162 „HMDS query returned no data“: Für den Zeitraum gibt es keine Kurse.
+/// Andere 162er (etwa Pacing-Verstöße) bleiben Fehler.
+fn is_no_data_notice(code: i32, message: &str) -> bool {
+    code == 162 && message.to_ascii_lowercase().contains("returned no data")
 }
 
 /// Hält das IB-Limit für Historienabfragen ein (siehe [`IB_HIST_PACING`]).
@@ -695,6 +712,13 @@ mod tests {
         let examined = std::collections::BTreeSet::new();
         keep_unchecked(&mut chosen, &prev, &examined, &std::collections::BTreeSet::from([1]), &stored);
         assert_eq!(chosen.iter().map(|b| b.conid).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn only_the_no_data_notice_counts_as_definitive() {
+        assert!(is_no_data_notice(162, "Historical Market Data Service error message:HMDS query returned no data: XYZ"));
+        assert!(!is_no_data_notice(162, "Historical Market Data Service error message:Historical data request pacing violation"));
+        assert!(!is_no_data_notice(1100, "Connectivity between IB and Trader Workstation has been lost."));
     }
 
     #[test]

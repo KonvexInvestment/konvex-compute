@@ -82,8 +82,11 @@ const BOCPD_WARMUP: usize = 20;
 /// höchstens so viele, und erst ab so vielen.
 const BOCPD_SCALE_WINDOW: usize = 756;
 const BOCPD_SCALE_MIN_OBS: usize = 10;
-/// Untergrenze der Skala, wenn alle vorherigen Werte gleich sind (etwa eine flache Kurve).
-const BOCPD_SCALE_FLOOR: f64 = 1e-6;
+/// Untergrenzen der Skala je Reihe: Nach einer flachen Phase soll ein Mikro-Tick keinen Bruch
+/// auslösen. Beispielwerte: Der typische Tagesausschlag des Stressindex liegt bei etwa 0,04,
+/// der des nahen Medians bei einigen Zehntelprozent.
+const BOCPD_MIN_SCALE_PRICE: f64 = 0.002;
+const BOCPD_MIN_SCALE_FSI: f64 = 0.01;
 /// Liegt die letzte vollständige Einstufung länger zurück, gilt das Regime als unbekannt.
 const REGIME_STALE_DAYS: i64 = 3;
 
@@ -581,10 +584,10 @@ impl NigParams {
 /// robuste Streuung der vorherigen normiert (höchstens [`BOCPD_SCALE_WINDOW`]), damit
 /// die Vorannahmen einheitenfrei bleiben und spätere Daten frühere Werte nicht ändern.
 /// Ist der Median der Abweichungen null (mehr als die Hälfte der Werte gleich), zählt die
-/// mittlere absolute Abweichung, bei lauter gleichen Werten [`BOCPD_SCALE_FLOOR`]: So geht
-/// gerade der erste Sprung nach einer flachen Phase nicht verloren.
+/// mittlere absolute Abweichung. Jede Skala ist nach unten durch `min_scale` begrenzt: So geht
+/// der erste Sprung nach einer flachen Phase nicht verloren, ein Mikro-Tick wird aber kein Bruch.
 /// Vor [`BOCPD_SCALE_MIN_OBS`] vorherigen Beobachtungen bleibt der Wert NaN.
-pub fn bocpd_recent_break(xs: &[f64], hazard_lambda: f64, recent: usize, max_run: usize) -> Vec<f64> {
+pub fn bocpd_recent_break(xs: &[f64], hazard_lambda: f64, recent: usize, max_run: usize, min_scale: f64) -> Vec<f64> {
     if xs.is_empty() {
         return Vec::new();
     }
@@ -598,13 +601,8 @@ pub fn bocpd_recent_break(xs: &[f64], hazard_lambda: f64, recent: usize, max_run
                 let mut dev: Vec<f64> = win.iter().map(|v| (v - med).abs()).collect();
                 let mean_dev = dev.iter().sum::<f64>() / dev.len() as f64;
                 let mad = median(&mut dev)? * 1.4826;
-                Some(if mad > 1e-12 {
-                    mad
-                } else if mean_dev > 1e-12 {
-                    mean_dev * 1.2533
-                } else {
-                    BOCPD_SCALE_FLOOR
-                })
+                let raw = if mad > 0.0 { mad } else { mean_dev * 1.2533 };
+                Some(raw.max(min_scale).max(1e-12))
             })
             .flatten();
         seen.push(x);
@@ -794,6 +792,11 @@ fn is_weekend(d: NaiveDate) -> bool {
 /// Letztes Beobachtungsdatum der OAS-Reihen, das am Stichtag schon veröffentlicht war.
 /// ICE BofA veröffentlicht den Wert eines Tages am folgenden Geschäftstag: Am Montag ist der
 /// Freitag bekannt, am Samstag und Sonntag erst der Donnerstag. Feiertage bleiben unberücksichtigt.
+/// Liegt der letzte Tag mit Daten mehr als `max_days` vor `day`?
+fn gap_exceeds(last: Option<NaiveDate>, day: NaiveDate, max_days: i64) -> bool {
+    last.is_some_and(|l| (day - l).num_days() > max_days)
+}
+
 pub(crate) fn oas_known_until(day: NaiveDate) -> NaiveDate {
     let mut business = day;
     while is_weekend(business) {
@@ -893,6 +896,11 @@ fn stress_days(
             })
             .collect();
         let macro_block = (macro_scores.len() >= 2).then(|| mean(&macro_scores)).flatten();
+        // Unter dem Mindestquorum geht der Makroblock nicht ein, also auch nicht in
+        // Zusammensetzung und Datenstempel
+        if macro_block.is_none() {
+            source_dates.iter_mut().for_each(|d| *d = None);
+        }
         // Zusammensetzung: welche Quellen eingehen, je Emittent mit Anleihekorb und Rating.
         // Ändert sich eines davon, ist ein Sprung im Index keine Kreditbewegung.
         let mut parts: Vec<Option<(u64, usize)>> = source_dates.iter().map(|d| d.map(|_| (0, 0))).collect();
@@ -994,14 +1002,20 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
                 .unwrap_or(f64::NAN)
         })
         .collect();
-    let mut price_break = bocpd_recent_break(&price_changes, BOCPD_HAZARD_LAMBDA, BOCPD_RECENT, BOCPD_MAX_RUN);
-    let mut credit_break = bocpd_recent_break(&fsi_changes, BOCPD_HAZARD_LAMBDA, BOCPD_RECENT, BOCPD_MAX_RUN);
+    let mut price_break =
+        bocpd_recent_break(&price_changes, BOCPD_HAZARD_LAMBDA, BOCPD_RECENT, BOCPD_MAX_RUN, BOCPD_MIN_SCALE_PRICE);
+    let mut credit_break =
+        bocpd_recent_break(&fsi_changes, BOCPD_HAZARD_LAMBDA, BOCPD_RECENT, BOCPD_MAX_RUN, BOCPD_MIN_SCALE_FSI);
     mask_warmup(&mut price_break, BOCPD_WARMUP);
     mask_warmup(&mut credit_break, BOCPD_WARMUP);
 
     // 4. Tagesweise Einstufung mit Hysterese und Bestätigung
     let mut stress_high = false;
     let mut falling = false;
+    // Letzte Tage mit Stressindex bzw. Kurvenänderung: Nach einer längeren Lücke beginnt die
+    // jeweilige Hysterese neu, statt einen Zustand von vor der Lücke fortzuschreiben.
+    let mut last_fsi_day: Option<NaiveDate> = None;
+    let mut last_fall_day: Option<NaiveDate> = None;
     let mut confirmed = Regime::Unbekannt;
     let mut candidate = Regime::Unbekannt;
     let mut candidate_days = 0usize;
@@ -1029,8 +1043,16 @@ pub fn compute_regime(inputs: &ModelInputs, today: NaiveDate) -> RegimeReport {
             _ => None,
         };
 
+        if s.fsi.is_some() {
+            stress_high = stress_high && !gap_exceeds(last_fsi_day, *d, REGIME_STALE_DAYS);
+            last_fsi_day = Some(*d);
+        }
         stress_high = next_stress_state(stress_high, s.fsi);
         let fall = FallSignal { dn14, dp14, dn30, dp30, dbasis };
+        if fall.has_short() || fall.has_long() {
+            falling = falling && !gap_exceeds(last_fall_day, *d, REGIME_STALE_DAYS);
+            last_fall_day = Some(*d);
+        }
         falling = next_falling_state(falling, &fall);
         let (have_short, have_long) = (fall.has_short(), fall.has_long());
 

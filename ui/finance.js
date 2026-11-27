@@ -41,6 +41,7 @@ const fin = {
   status: null,
   running: false,
   settingsDirty: false,
+  formRev: 0, // steigt mit jeder Eingabe im Formular
   shownSettings: null,
   // Speichern erst, wenn das Formular einmal mit den gespeicherten Werten gefüllt ist:
   // Ein leeres Formular würde sonst Emittenten und IB-Schalter überschreiben.
@@ -131,7 +132,11 @@ export function initFinance(deps) {
     saveSettings();
   });
   // Eingaben vor dem ersten Laden zählen nicht: Das Formular wird dann ohnehin überschrieben
-  $("fin-settings").addEventListener("input", () => { if (fin.settingsLoaded) fin.settingsDirty = true; });
+  $("fin-settings").addEventListener("input", () => {
+    if (!fin.settingsLoaded) return;
+    fin.settingsDirty = true;
+    fin.formRev += 1;
+  });
 
   deps.listen("compute:credit", (event) => {
     const st = event && event.payload;
@@ -206,14 +211,13 @@ async function triggerCreditRefresh() {
     if (alreadyRunning) fin.deps.showToast("Der Kreditabruf läuft bereits im Hintergrund.");
     else fin.deps.setActionError("Kreditdaten konnten nicht aktualisiert werden.", err);
   } finally {
-    const eventSeen = fin.statusEpoch !== epoch;
-    if (alreadyRunning) {
-      // Der Hintergrundabruf meldet sein Ende per compute:credit. Kam schon ein Event, gilt
-      // dessen Stand; sonst bis zum Ende-Event als laufend zeigen.
-      if (!eventSeen) fin.running = true;
+    if (fin.statusEpoch !== epoch) {
+      // Seit dem Klick kamen Status-Events: Sie sind maßgeblich, auch für einen inzwischen
+      // gestarteten neuen Lauf. Das Ende-Event rechnet selbst neu.
       renderStatus();
-    } else if (eventSeen && !fin.running) {
-      // Das Ende-Event kam vor der Antwort und hat schon neu gerechnet
+    } else if (alreadyRunning) {
+      // Der Hintergrundabruf meldet sein Ende per compute:credit
+      fin.running = true;
       renderStatus();
     } else {
       fin.running = false;
@@ -250,11 +254,15 @@ async function saveSettings() {
   updateSaveButton();
   const form = $("fin-settings");
   form.setAttribute("aria-busy", "true");
+  const rev = fin.formRev;
   try {
     const clean = await fin.deps.invoke("save_credit_settings", { settings: readSettingsForm() });
-    fin.settingsDirty = false;
-    fin.shownSettings = null;
-    fillSettings(clean, true);
+    // Eingaben nach dem Absenden bleiben stehen und gelten weiter als ungespeichert
+    if (rev === fin.formRev) {
+      fin.settingsDirty = false;
+      fin.shownSettings = null;
+      fillSettings(clean, true);
+    }
     fin.deps.showToast("Einstellungen gespeichert. Neue Emittenten erscheinen nach dem nächsten Kreditabruf.");
     reloadIfActive();
   } catch (err) {
