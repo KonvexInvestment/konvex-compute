@@ -38,6 +38,8 @@ const AUTO_BACKFILL_MIN_AGE_HOURS: i64 = 20;
 const SCHEDULER_TICK_SECS: u64 = 30;
 /// Kredit- und Anleihedaten ändern sich täglich: Abruf höchstens alle sechs Stunden.
 const CREDIT_REFRESH_HOURS: i64 = 6;
+/// Ältester Tag der Zinskurve, der noch als aktueller Abruf gilt (Feiertage, lange Wochenenden).
+const TREASURY_MAX_AGE_DAYS: i64 = 7;
 /// Nach einem Fehlschlag frühestens nach dieser Zeit erneut versuchen.
 const CREDIT_RETRY_MIN: i64 = 30;
 /// Prüftakt des Kredit-Pollers.
@@ -45,6 +47,26 @@ const CREDIT_TICK_SECS: u64 = 300;
 const GPU_KEYS_ALLOWED: [&str; 4] = ["H100", "H200", "B200", "B300"];
 
 /// True, wenn der RFC3339-Zeitstempel fehlt, unlesbar oder älter als `max_age` ist.
+/// Eine Zinskurve zählt als Erfolg, wenn ihr letzter Tag höchstens TREASURY_MAX_AGE_DAYS
+/// alt ist und an diesem Tag mindestens drei Laufzeiten Werte haben (so viele braucht die
+/// Spreadrechnung zum Interpolieren).
+fn treasury_curve_check(
+    curve: &std::collections::BTreeMap<String, Vec<(chrono::NaiveDate, f64)>>,
+    today: chrono::NaiveDate,
+) -> Result<(), String> {
+    let Some(last) = curve.get(TREASURY_ANCHOR_SERIES).and_then(|v| v.iter().map(|p| p.0).max()) else {
+        return Err("Treasury.gov: keine Renditen im Abrufzeitraum".into());
+    };
+    if (today - last).num_days() > TREASURY_MAX_AGE_DAYS {
+        return Err(format!("Treasury.gov: letzte Zinskurve vom {}, keine aktuelle", last.format("%d.%m.%Y")));
+    }
+    let tenors = curve.values().filter(|v| v.iter().any(|p| p.0 == last)).count();
+    if tenors < 3 {
+        return Err(format!("Treasury.gov: am {} nur {tenors} Laufzeiten", last.format("%d.%m.%Y")));
+    }
+    Ok(())
+}
+
 fn is_older_than(ts: Option<&str>, max_age: chrono::Duration) -> bool {
     match ts.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
         Some(dt) => chrono::Utc::now().signed_duration_since(dt) > max_age,
@@ -228,9 +250,11 @@ impl AppState {
     }
 
     /// Lädt die Treasury-Kurve (Treasury.gov), die OAS-Reihen (FRED) und, falls erreichbar,
-    /// Anleihekurse über IB.
-    async fn run_credit_refresh(&self) -> Result<CreditStatus, String> {
-        let Ok(_guard) = self.credit_lock.try_lock() else {
+    /// Anleihekurse über IB. Automatische Läufe fragen IB nur ab, wenn der letzte IB-Erfolg
+    /// älter als CREDIT_REFRESH_HOURS ist: Ein Teilfehler bei FRED wiederholt sonst alle
+    /// CREDIT_RETRY_MIN Minuten den minutenlangen Anleiheabruf.
+    async fn run_credit_refresh(&self, manual: bool) -> Result<CreditStatus, String> {
+        let Ok(guard) = self.credit_lock.try_lock() else {
             return Err("Kreditabruf läuft bereits.".into());
         };
         self.crediting.store(true, Ordering::Relaxed);
@@ -247,9 +271,9 @@ impl AppState {
         let mut treasury_ok = false;
         match fetch_treasury_curve(&self.client, from_for(TREASURY_ANCHOR_SERIES), today).await {
             Ok(curve) => {
-                treasury_ok = curve.get(TREASURY_ANCHOR_SERIES).is_some_and(|v| !v.is_empty());
-                if !treasury_ok {
-                    errors.push("Treasury.gov: keine Renditen im Abrufzeitraum".into());
+                match treasury_curve_check(&curve, today) {
+                    Ok(()) => treasury_ok = true,
+                    Err(e) => errors.push(e),
                 }
                 for (id, points) in &curve {
                     if let Err(e) = self.store.save_credit_series(id, points) {
@@ -277,7 +301,12 @@ impl AppState {
         }
 
         let settings = self.store.load_credit_settings();
-        if settings.ib_enabled {
+        let ib_due = manual
+            || is_older_than(
+                self.store.get_meta("ib_last_success_at").ok().flatten().as_deref(),
+                chrono::Duration::hours(CREDIT_REFRESH_HOURS),
+            );
+        if settings.ib_enabled && ib_due {
             let previous = self.store.load_bond_selection().unwrap_or_default();
             let stored = self.store.load_stored_bonds().unwrap_or_default();
             let outcome = fetch_ib_bonds(&settings, &previous, &stored, today).await;
@@ -294,14 +323,18 @@ impl AppState {
             };
             let _ = self.store.set_meta("ib_last_status", &status);
             if outcome.port.is_some() && !outcome.selections.is_empty() {
-                match self.store.save_ib_outcome(&outcome) {
-                    Ok(_) => {
+                match self.store.save_ib_outcome(&outcome, today) {
+                    // Erfolg nur mit mindestens einer neu geladenen Kursreihe
+                    Ok(_) if !outcome.histories.is_empty() => {
                         let _ = self.store.set_meta("ib_last_success_at", &now_s);
                     }
+                    Ok(_) => {}
                     Err(e) => errors.push(e),
                 }
             }
             errors.extend(outcome.errors);
+        } else if settings.ib_enabled {
+            // Anleihekurse sind aktuell genug; der Status des letzten IB-Laufs bleibt stehen
         } else {
             let _ = self.store.set_meta("ib_last_status", "IB-Abruf ausgeschaltet");
         }
@@ -317,6 +350,9 @@ impl AppState {
             &serde_json::to_string(&errors).unwrap_or_else(|_| "[]".into()),
         );
         self.crediting.store(false, Ordering::Relaxed);
+        // Erst die Sperre freigeben, dann das Ende melden: Ein Klick nach dem Ende-Event
+        // bekommt so nie mehr „läuft bereits“.
+        drop(guard);
         self.emit_credit();
         if fred_ok == 0 && !treasury_ok {
             return Err(format!(
@@ -526,7 +562,7 @@ async fn get_finance_view(
 
 #[tauri::command]
 async fn refresh_credit_now(state: State<'_, Arc<AppState>>) -> Result<CreditStatus, String> {
-    state.run_credit_refresh().await
+    state.run_credit_refresh(true).await
 }
 
 #[tauri::command]
@@ -535,7 +571,7 @@ async fn save_credit_settings(
     settings: CreditSettings,
 ) -> Result<CreditSettings, String> {
     let clean = settings.validated()?;
-    state.store.save_credit_settings(&clean)?;
+    state.store.save_credit_settings(&clean, chrono::Utc::now().date_naive())?;
     Ok(clean)
 }
 
@@ -577,7 +613,7 @@ pub fn run() {
                 tokio::time::sleep(Duration::from_secs(20)).await;
                 loop {
                     if credit_state.credit_due() {
-                        let _ = credit_state.run_credit_refresh().await;
+                        let _ = credit_state.run_credit_refresh(false).await;
                     }
                     tokio::time::sleep(Duration::from_secs(CREDIT_TICK_SECS)).await;
                 }

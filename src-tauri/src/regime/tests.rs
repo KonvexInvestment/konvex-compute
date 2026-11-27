@@ -105,8 +105,8 @@ fn bocpd_needs_a_scale_and_masks_the_warmup() {
     assert!(raw[..11].iter().all(|p| p.is_nan()), "{raw:?}");
     assert!(raw[11..].iter().all(|p| p.is_finite()), "{raw:?}");
     let mut p = raw.clone();
-    // Die 13. gültige Beobachtung steht wegen der Lücke an Index 13
-    mask_warmup(&mut p, &xs, 13);
+    // Das dritte echte Update steht an Index 13 (zehn Werte für die Skala, eine Lücke)
+    mask_warmup(&mut p, 3);
     assert!(p[..13].iter().all(|v| v.is_nan()));
     assert!(p[13..].iter().all(|v| v.is_finite()));
 }
@@ -406,6 +406,8 @@ fn issuer_gap_feeds_the_ai_block() {
         key: "X".into(),
         label: "X".into(),
         agency_rating: "BBB".into(),
+        ratings: vec![],
+        members: BTreeMap::new(),
         linked_bp: spreads.clone(),
         spreads_bp: spreads,
         bonds: vec![],
@@ -473,6 +475,8 @@ fn distress_alone_is_a_hint_not_an_early_warning() {
         key: "X".into(),
         label: "X".into(),
         agency_rating: "B".into(),
+        ratings: vec![],
+        members: BTreeMap::new(),
         linked_bp: spreads.clone(),
         spreads_bp: spreads,
         bonds: vec![],
@@ -481,4 +485,82 @@ fn distress_alone_is_a_hint_not_an_early_warning() {
     assert_eq!(r.regime, Regime::Entkoppelt);
     assert!(r.warnings.iter().any(|w| w.contains("Notlagenbereich")), "{:?}", r.warnings);
     assert!(!r.early_warning);
+}
+
+#[test]
+fn oas_values_count_from_the_next_business_day() {
+    // 27.11.2026 ist ein Freitag
+    let fri = NaiveDate::from_ymd_opt(2026, 11, 27).unwrap();
+    let day = |n: i64| fri + Duration::days(n);
+    assert_eq!(oas_known_until(fri), day(-1));
+    assert_eq!(oas_known_until(day(1)), day(-1), "Samstag: Freitag noch nicht veröffentlicht");
+    assert_eq!(oas_known_until(day(2)), day(-1), "Sonntag");
+    assert_eq!(oas_known_until(day(3)), fri, "Montag: Freitag bekannt");
+    assert_eq!(oas_known_until(day(4)), day(3), "Dienstag");
+}
+
+fn issuer(spreads: Series, ratings: Vec<(NaiveDate, String)>, members: BTreeMap<NaiveDate, u64>) -> IssuerSeries {
+    IssuerSeries {
+        key: "X".into(),
+        label: "X".into(),
+        agency_rating: ratings.last().map(|r| r.1.clone()).unwrap_or_else(|| "BBB".into()),
+        ratings,
+        members,
+        linked_bp: spreads.clone(),
+        spreads_bp: spreads,
+        bonds: vec![],
+    }
+}
+
+#[test]
+fn a_rating_change_keeps_history_and_is_no_credit_move() {
+    let (base, today) = build(&Scenario { stress: calm, price: flat, spot: flat });
+    let spreads: Series = (0..200).map(|i| (today - Duration::days(i), 300.0)).collect();
+    let change = today - Duration::days(20);
+    let mut before = base.clone();
+    before.issuers.push(issuer(spreads.clone(), vec![(NaiveDate::MIN, "BBB".into())], BTreeMap::new()));
+    let mut after = base;
+    after.issuers.push(issuer(
+        spreads,
+        vec![(NaiveDate::MIN, "BBB".into()), (change, "BB".into())],
+        BTreeMap::new(),
+    ));
+    let (a, b) = (compute_regime(&before, today), compute_regime(&after, today));
+    for (x, y) in a.history.iter().zip(&b.history) {
+        if x.date < change {
+            assert_eq!(x.fsi, y.fsi, "{}", x.date);
+            assert_eq!(x.credit_break_prob, y.credit_break_prob, "{}", x.date);
+        }
+    }
+    let at = |r: &RegimeReport| r.history.iter().find(|h| h.date == change).unwrap().fsi.unwrap();
+    assert!(at(&b) < at(&a), "besseres Rating, kleinere Lücke");
+    assert_eq!(b.issuers[0].agency_rating, "BB");
+}
+
+#[test]
+fn a_basket_change_is_no_credit_move() {
+    let (base, today) = build(&Scenario { stress: calm, price: flat, spot: flat });
+    let switch = today - Duration::days(10);
+    let spreads: Series = (0..200)
+        .map(|i| {
+            let d = today - Duration::days(i);
+            (d, if d < switch { 300.0 } else { 600.0 })
+        })
+        .collect();
+    let change_at_switch = |members: BTreeMap<NaiveDate, u64>| {
+        let mut inputs = base.clone();
+        inputs.issuers.push(issuer(spreads.clone(), vec![], members));
+        let macro_z: Vec<(&str, &str, Series)> = MACRO_COMPONENTS
+            .iter()
+            .map(|(id, label)| (*id, *label, rolling_robust_z(&inputs.oas[*id], OAS_Z_WINDOW, OAS_Z_MIN_OBS)))
+            .collect();
+        let stress = stress_days(&inputs, &macro_z, &issuer_positions(&inputs), today - Duration::days(60), today);
+        stress[&switch].fsi_change_since(&stress[&(switch - Duration::days(1))], false)
+    };
+    // Gleiche Anleihen: Der Sprung ist eine Kreditbewegung
+    let same = change_at_switch(spreads.keys().map(|d| (*d, 1)).collect());
+    assert!(same.unwrap() > 0.1, "{same:?}");
+    // Neue Anleihe im Korb: derselbe Sprung zählt nicht als Bewegung
+    let switched = change_at_switch(spreads.keys().map(|d| (*d, if *d < switch { 1 } else { 2 })).collect());
+    assert_eq!(switched, None);
 }

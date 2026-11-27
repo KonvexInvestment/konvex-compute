@@ -130,7 +130,8 @@ export function initFinance(deps) {
     evt.preventDefault();
     saveSettings();
   });
-  $("fin-settings").addEventListener("input", () => { fin.settingsDirty = true; });
+  // Eingaben vor dem ersten Laden zählen nicht: Das Formular wird dann ohnehin überschrieben
+  $("fin-settings").addEventListener("input", () => { if (fin.settingsLoaded) fin.settingsDirty = true; });
 
   deps.listen("compute:credit", (event) => {
     const st = event && event.payload;
@@ -148,7 +149,7 @@ export function initFinance(deps) {
 
 export function renderFinance(gpu) {
   const cached = fin.views[gpu];
-  if (cached) draw(cached.view);
+  if (cached) draw(cached.view, !!cached.at);
   else drawLoading();
   if (!cached || !cached.at || Date.now() - cached.at > CACHE_MS) load(gpu);
 }
@@ -172,7 +173,8 @@ async function load(gpu) {
       fin.running = !!view.status.running;
     }
     if (reqId !== fin.seq || fin.deps.getGpu() !== gpu || !fin.deps.isActive()) return;
-    draw(view);
+    // Eine veraltete Antwort darf das Formular nicht mit alten Einstellungen füllen
+    draw(view, version === fin.version);
   } catch (err) {
     if (reqId !== fin.seq) return;
     fin.deps.setActionError("Das Finanzierungsregime konnte nicht berechnet werden.", err);
@@ -188,6 +190,9 @@ async function load(gpu) {
 async function triggerCreditRefresh() {
   if (fin.running) return;
   fin.running = true;
+  // Ab hier zählt der lokale Status; ältere Antworten von get_finance_view überschreiben ihn nicht
+  fin.statusEpoch += 1;
+  const epoch = fin.statusEpoch;
   renderStatus();
   fin.deps.showToast("Lade Zinskurve, Kreditaufschläge und Anleihekurse. Der erste IB-Abruf dauert einige Minuten.");
   let alreadyRunning = false;
@@ -201,9 +206,14 @@ async function triggerCreditRefresh() {
     if (alreadyRunning) fin.deps.showToast("Der Kreditabruf läuft bereits im Hintergrund.");
     else fin.deps.setActionError("Kreditdaten konnten nicht aktualisiert werden.", err);
   } finally {
+    const eventSeen = fin.statusEpoch !== epoch;
     if (alreadyRunning) {
-      // Der Hintergrundabruf meldet sein Ende per compute:credit; erst dann neu rechnen
-      fin.running = true;
+      // Der Hintergrundabruf meldet sein Ende per compute:credit. Kam schon ein Event, gilt
+      // dessen Stand; sonst bis zum Ende-Event als laufend zeigen.
+      if (!eventSeen) fin.running = true;
+      renderStatus();
+    } else if (eventSeen && !fin.running) {
+      // Das Ende-Event kam vor der Antwort und hat schon neu gerechnet
       renderStatus();
     } else {
       fin.running = false;
@@ -264,7 +274,7 @@ function drawLoading() {
   $("fin-regime").innerHTML = `<p class="section-sub">Berechne das Finanzierungsregime …</p>`;
 }
 
-function draw(view) {
+function draw(view, settingsFresh = true) {
   const r = view.report;
   renderRegime(r);
   renderKpis(r);
@@ -272,7 +282,7 @@ function draw(view) {
   renderIssuers(r, view.bonds || []);
   renderMacro(r);
   renderStatus();
-  fillSettings(view.settings, false);
+  if (settingsFresh) fillSettings(view.settings, false);
   annotateTerms($("panel-finance"));
 }
 
@@ -314,7 +324,7 @@ function renderRegime(r) {
   const trans = (r.transitions || []).slice(-4).reverse();
   if (trans.length) {
     parts.push(`<div class="fin-transitions"><span class="toolbar-label">Letzte Wechsel</span>${trans
-      .map((t) => `<span class="mono">${escapeHtml(fmtDay(t.date))}</span> ${regimeChip(t.to, REGIME_SHORT[t.to] || t.to_label)}`)
+      .map((t) => `<span class="mono" title="Bestätigt am ${escapeHtml(fmtDay(t.date))}, erste Anzeichen ab ${escapeHtml(fmtDay(t.signal_since))}">${escapeHtml(fmtDay(t.date))}</span> ${regimeChip(t.to, REGIME_SHORT[t.to] || t.to_label)}`)
       .join(" ")}</div>`);
   }
   $("fin-regime").innerHTML = parts.join("");
@@ -452,7 +462,7 @@ function issuerRow(i) {
 }
 
 function fillSettings(s, force) {
-  if (!s || fin.saving || (fin.settingsDirty && !force)) return;
+  if (!s || (!force && (fin.saving || fin.settingsDirty))) return;
   const sig = JSON.stringify(s);
   if (!force && fin.shownSettings === sig) return;
   fin.shownSettings = sig;

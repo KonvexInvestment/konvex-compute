@@ -71,13 +71,25 @@ CREATE TABLE IF NOT EXISTS credit_series (
     PRIMARY KEY (series_id, date_iso)
 );
 
-CREATE TABLE IF NOT EXISTS credit_bonds (
+-- Anleihekorb je Emittent mit Gültigkeit: von valid_from bis einschließlich valid_to
+-- (NULL: gehört weiter dazu). Ausgeschiedene Anleihen bleiben mit ihren Kursen für den Verlauf.
+CREATE TABLE IF NOT EXISTS credit_basket (
     issuer TEXT NOT NULL,
     conid INTEGER NOT NULL,
     description TEXT NOT NULL,
     coupon REAL NOT NULL,
     maturity TEXT NOT NULL,
-    PRIMARY KEY (issuer, conid)
+    valid_from TEXT NOT NULL,
+    valid_to TEXT,
+    PRIMARY KEY (issuer, conid, valid_from)
+);
+
+-- Agenturrating je Emittent ab Gültigkeitsbeginn
+CREATE TABLE IF NOT EXISTS credit_ratings (
+    issuer TEXT NOT NULL,
+    valid_from TEXT NOT NULL,
+    rating TEXT NOT NULL,
+    PRIMARY KEY (issuer, valid_from)
 );
 
 CREATE TABLE IF NOT EXISTS bond_prices (
@@ -131,6 +143,7 @@ impl ComputeStore {
         let conn = self.connect()?;
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|e| format!("SQLite-Schema-Fehler: {e}"))?;
+        crate::credit_store::migrate_credit_tables(&conn)?;
         Ok(())
     }
 

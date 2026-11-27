@@ -338,31 +338,94 @@ pub fn bond_spread_series(
         .collect()
 }
 
-/// Letzter Spread einer Anleihe bis einschließlich `day`, höchstens [`SPREAD_CARRY_DAYS`] alt.
-fn carried(series: &BTreeMap<NaiveDate, f64>, day: NaiveDate) -> Option<f64> {
-    let (d, v) = series.range(..=day).next_back()?;
-    ((day - *d).num_days() <= SPREAD_CARRY_DAYS).then_some(*v)
+/// Zeitraum, in dem eine Anleihe zum Korb gehörte: von `from` bis einschließlich `to`
+/// (`None`: gehört weiter dazu).
+pub type BasketInterval = (NaiveDate, Option<NaiveDate>);
+
+/// Eine Anleihe des Korbs mit den Zeiträumen ihrer Mitgliedschaft.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BasketBond {
+    pub bond: SelectedBond,
+    pub active: Vec<BasketInterval>,
 }
 
-fn union_dates(per_bond: &[BTreeMap<NaiveDate, f64>]) -> Vec<NaiveDate> {
-    per_bond
+impl BasketBond {
+    /// Mitglied über die ganze Historie (erster Korb eines Emittenten).
+    pub fn always(bond: SelectedBond) -> Self {
+        Self { bond, active: vec![(NaiveDate::MIN, None)] }
+    }
+}
+
+/// Tagesspreads einer Anleihe, beschränkt auf ihre Zeit im Korb.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BondSpreads {
+    pub conid: i32,
+    pub spreads: BTreeMap<NaiveDate, f64>,
+    pub active: Vec<BasketInterval>,
+}
+
+impl BondSpreads {
+    pub fn new(conid: i32, spreads: BTreeMap<NaiveDate, f64>, active: Vec<BasketInterval>) -> Self {
+        let inside = |d: &NaiveDate| active.iter().any(|(f, t)| *d >= *f && t.is_none_or(|t| *d <= t));
+        let spreads = spreads.into_iter().filter(|(d, _)| inside(d)).collect();
+        Self { conid, spreads, active }
+    }
+
+    /// Beginn des Korbzeitraums, in dem `day` liegt.
+    fn interval_start(&self, day: NaiveDate) -> Option<NaiveDate> {
+        self.active
+            .iter()
+            .filter(|(f, t)| day >= *f && t.is_none_or(|t| day <= t))
+            .map(|(f, _)| *f)
+            .max()
+    }
+
+    /// Letzter Spread bis einschließlich `day`, höchstens [`SPREAD_CARRY_DAYS`] alt und nur
+    /// innerhalb des laufenden Korbzeitraums: Nach dem Austritt zählt die Anleihe nicht mehr.
+    fn carried(&self, day: NaiveDate) -> Option<f64> {
+        let from = self.interval_start(day)?;
+        let (d, v) = self.spreads.range(from..=day).next_back()?;
+        ((day - *d).num_days() <= SPREAD_CARRY_DAYS).then_some(*v)
+    }
+}
+
+fn union_dates(bonds: &[BondSpreads]) -> Vec<NaiveDate> {
+    bonds
         .iter()
-        .flat_map(|s| s.keys().copied())
+        .flat_map(|b| b.spreads.keys().copied())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()
 }
 
-/// Stichtagsgetreues Niveau: je Tag der Mittelwert der Anleihen, die bis dahin notiert haben
-/// (fehlende Tage mit dem letzten Spread überbrückt). Spätere Kurse oder später hinzukommende
-/// Anleihen ändern frühere Tage nicht. Kommt eine Anleihe neu dazu, verschiebt sich das Niveau
-/// an diesem Tag um ihren Beitrag zum Mittelwert.
-pub fn point_in_time_mean(per_bond: &[BTreeMap<NaiveDate, f64>]) -> BTreeMap<NaiveDate, f64> {
-    union_dates(per_bond)
+/// Stichtagsgetreues Niveau: je Tag der Mittelwert der Anleihen, die an diesem Tag zum Korb
+/// gehören und bis dahin notiert haben (fehlende Tage mit dem letzten Spread überbrückt).
+/// Spätere Kurse, später hinzukommende oder ausscheidende Anleihen ändern frühere Tage nicht.
+/// Kommt eine Anleihe neu dazu, verschiebt sich das Niveau an diesem Tag um ihren Beitrag.
+pub fn point_in_time_mean(bonds: &[BondSpreads]) -> BTreeMap<NaiveDate, f64> {
+    union_dates(bonds)
         .into_iter()
         .filter_map(|d| {
-            let v: Vec<f64> = per_bond.iter().filter_map(|s| carried(s, d)).collect();
+            let v: Vec<f64> = bonds.iter().filter_map(|b| b.carried(d)).collect();
             (!v.is_empty()).then(|| (d, v.iter().sum::<f64>() / v.len() as f64))
+        })
+        .collect()
+}
+
+/// Fingerabdruck der Anleihen, die an einem Tag ins Niveau eingehen. Ändert er sich, ist ein
+/// Sprung im Niveau ein Korbwechsel und keine Kreditbewegung.
+pub fn basket_members(bonds: &[BondSpreads]) -> BTreeMap<NaiveDate, u64> {
+    use std::hash::{Hash, Hasher};
+    union_dates(bonds)
+        .into_iter()
+        .filter_map(|d| {
+            let ids: Vec<i32> = bonds.iter().filter(|b| b.carried(d).is_some()).map(|b| b.conid).collect();
+            if ids.is_empty() {
+                return None;
+            }
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ids.hash(&mut h);
+            Some((d, h.finish()))
         })
         .collect()
 }
@@ -371,8 +434,8 @@ pub fn point_in_time_mean(per_bond: &[BTreeMap<NaiveDate, f64>]) -> BTreeMap<Nai
 /// mittlere Veränderung der Anleihen, die an beiden Tagen einen Spread haben. Ein Wechsel im
 /// Korb erzeugt deshalb keinen Sprung. Nur für Veränderungen über die Zeit gedacht, nicht als
 /// Niveau. Rechnet vorwärts, spätere Daten ändern frühere Werte nicht.
-pub fn linked_changes(per_bond: &[BTreeMap<NaiveDate, f64>]) -> BTreeMap<NaiveDate, f64> {
-    let dates = union_dates(per_bond);
+pub fn linked_changes(bonds: &[BondSpreads]) -> BTreeMap<NaiveDate, f64> {
+    let dates = union_dates(bonds);
     let mut out = BTreeMap::new();
     let Some(first) = dates.first() else {
         return out;
@@ -381,9 +444,9 @@ pub fn linked_changes(per_bond: &[BTreeMap<NaiveDate, f64>]) -> BTreeMap<NaiveDa
     out.insert(*first, level);
     for w in dates.windows(2) {
         let (d0, d1) = (w[0], w[1]);
-        let moves: Vec<f64> = per_bond
+        let moves: Vec<f64> = bonds
             .iter()
-            .filter_map(|s| Some(carried(s, d1)? - carried(s, d0)?))
+            .filter_map(|b| Some(b.carried(d1)? - b.carried(d0)?))
             .collect();
         if !moves.is_empty() {
             level += moves.iter().sum::<f64>() / moves.len() as f64;
@@ -393,27 +456,33 @@ pub fn linked_changes(per_bond: &[BTreeMap<NaiveDate, f64>]) -> BTreeMap<NaiveDa
     out
 }
 
-/// Tagesniveau und verkettete Veränderungen eines Emittenten, beide in Basispunkten.
+/// Tagesniveau, verkettete Veränderungen und Korbzusammensetzung eines Emittenten.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IssuerSpreads {
     pub level: BTreeMap<NaiveDate, f64>,
     pub linked: BTreeMap<NaiveDate, f64>,
+    pub members: BTreeMap<NaiveDate, u64>,
 }
 
-/// Tagesspreads (Basispunkte) eines Emittenten über seine ausgewählten Anleihen.
+/// Tagesspreads (Basispunkte) eines Emittenten über die Anleihen seines Korbs, jede nur in
+/// den Zeiträumen, in denen sie dazugehörte.
 pub fn issuer_spread_series(
-    bonds: &[SelectedBond],
+    basket: &[BasketBond],
     prices: &BTreeMap<i32, BTreeMap<NaiveDate, f64>>,
     treasury: &BTreeMap<String, BTreeMap<NaiveDate, f64>>,
 ) -> IssuerSpreads {
-    let per_bond: Vec<BTreeMap<NaiveDate, f64>> = bonds
+    let bonds: Vec<BondSpreads> = basket
         .iter()
-        .filter_map(|b| prices.get(&b.conid).map(|px| bond_spread_series(b, px, treasury)))
-        .filter(|s| !s.is_empty())
+        .filter_map(|b| {
+            let px = prices.get(&b.bond.conid)?;
+            Some(BondSpreads::new(b.bond.conid, bond_spread_series(&b.bond, px, treasury), b.active.clone()))
+        })
+        .filter(|s| !s.spreads.is_empty())
         .collect();
     IssuerSpreads {
-        level: point_in_time_mean(&per_bond),
-        linked: linked_changes(&per_bond),
+        level: point_in_time_mean(&bonds),
+        linked: linked_changes(&bonds),
+        members: basket_members(&bonds),
     }
 }
 
@@ -530,11 +599,15 @@ mod tests {
         values.iter().map(|(day, v)| (d(2026, 11, *day), *v)).collect()
     }
 
+    fn always(conid: i32, values: &[(u32, f64)]) -> BondSpreads {
+        BondSpreads::new(conid, pts(values), vec![(NaiveDate::MIN, None)])
+    }
+
     #[test]
     fn level_is_point_in_time_and_later_bonds_leave_history_alone() {
         // Anleihe A steigt am 2. um 10 bp, Anleihe B kommt am 3. mit höherem Niveau dazu
-        let a = pts(&[(2, 300.0), (3, 310.0), (4, 310.0)]);
-        let b = pts(&[(4, 410.0)]);
+        let a = always(1, &[(2, 300.0), (3, 310.0), (4, 310.0)]);
+        let b = always(2, &[(4, 410.0)]);
         let only_a = point_in_time_mean(std::slice::from_ref(&a));
         let both = point_in_time_mean(&[a, b]);
         assert_eq!(both[&d(2026, 11, 2)], 300.0);
@@ -552,20 +625,20 @@ mod tests {
     #[test]
     fn level_bridges_short_gaps_without_spikes() {
         // B fehlt am 3.: Ohne Überbrückung fiele das Mittel auf A allein
-        let a = pts(&[(2, 300.0), (3, 300.0), (4, 300.0)]);
-        let b = pts(&[(2, 500.0), (4, 500.0)]);
+        let a = always(1, &[(2, 300.0), (3, 300.0), (4, 300.0)]);
+        let b = always(2, &[(2, 500.0), (4, 500.0)]);
         let out = point_in_time_mean(&[a, b.clone()]);
         assert_eq!(out[&d(2026, 11, 3)], 400.0);
         // Nach mehr als SPREAD_CARRY_DAYS fällt eine Anleihe ohne Kurse heraus
-        let a_long = pts(&[(2, 300.0), (12, 300.0)]);
+        let a_long = always(1, &[(2, 300.0), (12, 300.0)]);
         let out = point_in_time_mean(&[a_long, b]);
         assert_eq!(out[&d(2026, 11, 12)], 300.0);
     }
 
     #[test]
     fn linked_changes_ignore_basket_changes_but_keep_moves() {
-        let a = pts(&[(2, 300.0), (3, 310.0), (4, 310.0), (5, 320.0)]);
-        let b = pts(&[(4, 410.0), (5, 430.0)]);
+        let a = always(1, &[(2, 300.0), (3, 310.0), (4, 310.0), (5, 320.0)]);
+        let b = always(2, &[(4, 410.0), (5, 430.0)]);
         let out = linked_changes(&[a, b]);
         assert_eq!(out[&d(2026, 11, 2)], 0.0);
         assert_eq!(out[&d(2026, 11, 3)], 10.0);
@@ -577,13 +650,39 @@ mod tests {
     }
 
     #[test]
+    fn basket_intervals_keep_history_and_mark_changes() {
+        // A gehört bis zum 4. zum Korb, B ab dem 5.; B hat rückwirkend Kurse ab dem 2.
+        let a = BondSpreads::new(1, pts(&[(2, 300.0), (3, 300.0), (4, 300.0), (5, 300.0)]), vec![(d(2026, 11, 1), Some(d(2026, 11, 4)))]);
+        let b = BondSpreads::new(2, pts(&[(2, 500.0), (3, 500.0), (4, 500.0), (5, 500.0), (6, 500.0)]), vec![(d(2026, 11, 5), None)]);
+        let level = point_in_time_mean(&[a.clone(), b.clone()]);
+        // Vor dem Eintritt zählen die rückwirkenden Kurse von B nicht, nach dem Austritt A nicht mehr
+        assert_eq!(level[&d(2026, 11, 4)], 300.0);
+        assert_eq!(level[&d(2026, 11, 5)], 500.0);
+        assert_eq!(level[&d(2026, 11, 6)], 500.0);
+        let members = basket_members(&[a.clone(), b.clone()]);
+        assert_eq!(members[&d(2026, 11, 3)], members[&d(2026, 11, 4)]);
+        assert_ne!(members[&d(2026, 11, 4)], members[&d(2026, 11, 5)]);
+        // Der Wechsel ist keine Bewegung
+        let linked = linked_changes(&[a, b]);
+        assert_eq!(linked[&d(2026, 11, 6)], 0.0);
+        // Ein Wiedereintritt überbrückt nicht die Zeit außerhalb des Korbs
+        let back = BondSpreads::new(
+            3,
+            pts(&[(2, 400.0), (9, 410.0)]),
+            vec![(d(2026, 11, 1), Some(d(2026, 11, 2))), (d(2026, 11, 5), None)],
+        );
+        assert_eq!(back.carried(d(2026, 11, 5)), None);
+        assert_eq!(back.carried(d(2026, 11, 9)), Some(410.0));
+    }
+
+    #[test]
     fn issuer_spread_is_mean_over_bonds_against_matching_treasury() {
         let day = d(2026, 11, 27);
         let mut tsy = BTreeMap::new();
         for (id, _, _) in TREASURY_SERIES {
             tsy.insert(id.to_string(), BTreeMap::from([(day, 4.0)]));
         }
-        let bonds = vec![
+        let bonds = [
             SelectedBond { conid: 1, description: "A".into(), coupon_pct: 5.0, maturity: d(2031, 7, 15) },
             SelectedBond { conid: 2, description: "B".into(), coupon_pct: 5.0, maturity: d(2033, 7, 15) },
             SelectedBond { conid: 3, description: "C".into(), coupon_pct: 5.0, maturity: d(2035, 7, 15) },
@@ -592,7 +691,8 @@ mod tests {
         prices.insert(1, BTreeMap::from([(day, 100.0)]));
         prices.insert(2, BTreeMap::from([(day, 95.0)]));
         prices.insert(3, BTreeMap::from([(day, 80.0)]));
-        let s = issuer_spread_series(&bonds, &prices, &tsy).level;
+        let basket: Vec<BasketBond> = bonds.iter().cloned().map(BasketBond::always).collect();
+        let s = issuer_spread_series(&basket, &prices, &tsy).level;
         let expect: f64 = bonds
             .iter()
             .map(|b| {

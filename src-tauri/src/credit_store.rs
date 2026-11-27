@@ -1,7 +1,7 @@
 //! Speicherung der Kredit- und Anleihedaten in der lokalen Datenbank sowie das
 //! Zusammenstellen der Modelleingaben.
 
-use crate::credit::{is_treasury_series, issuer_spread_series, SelectedBond};
+use crate::credit::{is_treasury_series, issuer_spread_series, BasketBond, BasketInterval, SelectedBond};
 use crate::credit_fetch::{all_credit_series_ids, CreditSettings, IbFetchOutcome, StoredBond};
 use crate::regime::{CurveDay, CurveNode, IssuerSeries, ModelInputs, Series};
 use crate::store::ComputeStore;
@@ -20,6 +20,34 @@ struct CurvePointLight {
     delivery_date: String,
     median: Option<f64>,
     p25: Option<f64>,
+}
+
+fn iso(d: NaiveDate) -> String {
+    d.format("%Y-%m-%d").to_string()
+}
+
+/// Überführt den Korb aus der ersten Fassung (ohne Gültigkeit) in `credit_basket`:
+/// Die bisherigen Anleihen gelten als erster Korb über die ganze Historie.
+pub(crate) fn migrate_credit_tables(conn: &Connection) -> Result<(), String> {
+    let old: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'credit_bonds')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("Migration credit_bonds: {e}"))?;
+    if old {
+        conn.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             INSERT OR IGNORE INTO credit_basket (issuer, conid, description, coupon, maturity, valid_from, valid_to)
+                 SELECT issuer, conid, description, coupon, maturity, '{}', NULL FROM credit_bonds;
+             DROP TABLE credit_bonds;
+             COMMIT;",
+            iso(EARLIEST)
+        ))
+        .map_err(|e| format!("Migration credit_bonds: {e}"))?;
+    }
+    Ok(())
 }
 
 fn parse_date(s: &str) -> Option<NaiveDate> {
@@ -53,29 +81,80 @@ impl ComputeStore {
             .unwrap_or_default()
     }
 
-    /// Speichert die Einstellungen. Anleihen und Kurse entfernter Emittenten werden gelöscht;
-    /// ausgeschaltete Emittenten behalten ihre Daten für ein späteres Wiedereinschalten.
-    pub fn save_credit_settings(&self, settings: &CreditSettings) -> Result<(), String> {
+    /// Speichert die Einstellungen in einer Transaktion. Ändert sich ein Agenturrating, gilt das
+    /// neue ab `today`; frühere Tage behalten das alte. Korb, Kurse und Ratings entfernter
+    /// Emittenten werden gelöscht, ausgeschaltete behalten ihre Daten.
+    pub fn save_credit_settings(&self, settings: &CreditSettings, today: NaiveDate) -> Result<(), String> {
         let json = serde_json::to_string(settings).map_err(|e| format!("Einstellungen: {e}"))?;
-        self.set_meta(SETTINGS_KEY, &json)?;
         let mut conn = self.connect()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("credit_bonds: {e}"))?;
+            .map_err(|e| format!("Einstellungen: {e}"))?;
+        let previous: CreditSettings = tx
+            .query_row("SELECT value FROM meta_kv WHERE key = ?1", params![SETTINGS_KEY], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(|e| format!("Einstellungen: {e}"))?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        tx.execute(
+            "INSERT INTO meta_kv (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SETTINGS_KEY, json],
+        )
+        .map_err(|e| format!("Einstellungen: {e}"))?;
+
+        for iss in &settings.issuers {
+            let latest: Option<String> = tx
+                .query_row(
+                    "SELECT rating FROM credit_ratings WHERE issuer = ?1 ORDER BY valid_from DESC LIMIT 1",
+                    params![iss.key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("credit_ratings: {e}"))?;
+            // Ohne Eintrag galt bisher das Rating der vorigen Einstellungen (oder der Voreinstellung)
+            let base = match latest {
+                Some(r) => r,
+                None => {
+                    let r0 = previous
+                        .issuers
+                        .iter()
+                        .find(|p| p.key == iss.key)
+                        .map_or_else(|| iss.agency_rating.clone(), |p| p.agency_rating.clone());
+                    tx.execute(
+                        "INSERT INTO credit_ratings (issuer, valid_from, rating) VALUES (?1, ?2, ?3)",
+                        params![iss.key, iso(EARLIEST), r0],
+                    )
+                    .map_err(|e| format!("credit_ratings: {e}"))?;
+                    r0
+                }
+            };
+            if base != iss.agency_rating {
+                tx.execute(
+                    "INSERT INTO credit_ratings (issuer, valid_from, rating) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(issuer, valid_from) DO UPDATE SET rating = excluded.rating",
+                    params![iss.key, iso(today), iss.agency_rating],
+                )
+                .map_err(|e| format!("credit_ratings: {e}"))?;
+            }
+        }
+
         let stored: Vec<String> = {
             let mut stmt = tx
-                .prepare("SELECT DISTINCT issuer FROM credit_bonds")
-                .map_err(|e| format!("credit_bonds: {e}"))?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| format!("credit_bonds: {e}"))?;
+                .prepare("SELECT issuer FROM credit_basket UNION SELECT issuer FROM credit_ratings")
+                .map_err(|e| format!("credit_basket: {e}"))?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| format!("credit_basket: {e}"))?;
             rows.flatten().collect()
         };
         for issuer in stored.iter().filter(|k| !settings.issuers.iter().any(|i| &i.key == *k)) {
-            tx.execute("DELETE FROM credit_bonds WHERE issuer = ?1", params![issuer])
-                .map_err(|e| format!("credit_bonds: {e}"))?;
+            tx.execute("DELETE FROM credit_basket WHERE issuer = ?1", params![issuer])
+                .map_err(|e| format!("credit_basket: {e}"))?;
+            tx.execute("DELETE FROM credit_ratings WHERE issuer = ?1", params![issuer])
+                .map_err(|e| format!("credit_ratings: {e}"))?;
         }
-        tx.execute("DELETE FROM bond_prices WHERE conid NOT IN (SELECT conid FROM credit_bonds)", [])
+        tx.execute("DELETE FROM bond_prices WHERE conid NOT IN (SELECT conid FROM credit_basket)", [])
             .map_err(|e| format!("bond_prices: {e}"))?;
-        tx.commit().map_err(|e| format!("credit_bonds: {e}"))
+        tx.commit().map_err(|e| format!("Einstellungen: {e}"))
     }
 
     pub fn latest_credit_date(&self, series_id: &str) -> Result<Option<NaiveDate>, String> {
@@ -137,36 +216,82 @@ impl ComputeStore {
         Ok(out)
     }
 
-    /// Ersetzt Auswahl und Kurse der abgerufenen Emittenten in einer Transaktion.
-    /// Kurse je Anleihe werden vollständig ersetzt, damit eine Reihe nie Quellen mischt.
-    pub fn save_ib_outcome(&self, outcome: &IbFetchOutcome) -> Result<usize, String> {
+    /// Schreibt Korb und Kurse der abgerufenen Emittenten in einer Transaktion.
+    /// Neue Anleihen gehören ab `today` zum Korb, beim ersten Korb eines Emittenten über die
+    /// ganze Historie; ausgeschiedene gelten bis zum Vortag und behalten ihre Kurse, damit
+    /// frühere Tage gleich bleiben. Emittenten, die inzwischen aus den Einstellungen entfernt
+    /// wurden, schreibt das Ergebnis nicht zurück. Eine Kursreihe mischt nie Quellen.
+    pub fn save_ib_outcome(&self, outcome: &IbFetchOutcome, today: NaiveDate) -> Result<usize, String> {
         let mut conn = self.connect()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("IB-Daten: {e}"))?;
+        let current: CreditSettings = tx
+            .query_row("SELECT value FROM meta_kv WHERE key = ?1", params![SETTINGS_KEY], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(|e| format!("Einstellungen: {e}"))?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
         let mut rows = 0;
+        let mut written: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
         for (issuer, bonds) in &outcome.selections {
-            tx.execute("DELETE FROM credit_bonds WHERE issuer = ?1", params![issuer])
-                .map_err(|e| format!("credit_bonds: {e}"))?;
-            for b in bonds {
-                tx.execute(
-                    "INSERT INTO credit_bonds (issuer, conid, description, coupon, maturity) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![issuer, b.conid, b.description, b.coupon_pct, b.maturity.format("%Y-%m-%d").to_string()],
-                )
-                .map_err(|e| format!("credit_bonds: {e}"))?;
+            if !current.issuers.iter().any(|i| &i.key == issuer) {
+                continue;
             }
+            let (has_any, open): (bool, Vec<(i32, String)>) = {
+                let any: bool = tx
+                    .query_row("SELECT EXISTS(SELECT 1 FROM credit_basket WHERE issuer = ?1)", params![issuer], |r| r.get(0))
+                    .map_err(|e| format!("credit_basket: {e}"))?;
+                let mut stmt = tx
+                    .prepare("SELECT conid, valid_from FROM credit_basket WHERE issuer = ?1 AND valid_to IS NULL")
+                    .map_err(|e| format!("credit_basket: {e}"))?;
+                let open = stmt
+                    .query_map(params![issuer], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(|e| format!("credit_basket: {e}"))?
+                    .flatten()
+                    .collect();
+                (any, open)
+            };
+            let start = if has_any { today } else { EARLIEST };
+            for (conid, from) in open.iter().filter(|(c, _)| !bonds.iter().any(|b| b.conid == *c)) {
+                if parse_date(from).is_some_and(|f| f >= today) {
+                    // Erst heute aufgenommen: Der Eintrag hat noch keinen Tag getragen
+                    tx.execute(
+                        "DELETE FROM credit_basket WHERE issuer = ?1 AND conid = ?2 AND valid_from = ?3",
+                        params![issuer, conid, from],
+                    )
+                } else {
+                    tx.execute(
+                        "UPDATE credit_basket SET valid_to = ?4 WHERE issuer = ?1 AND conid = ?2 AND valid_from = ?3",
+                        params![issuer, conid, from, iso(today - chrono::Duration::days(1))],
+                    )
+                }
+                .map_err(|e| format!("credit_basket: {e}"))?;
+            }
+            for b in bonds.iter().filter(|b| !open.iter().any(|(c, _)| *c == b.conid)) {
+                tx.execute(
+                    "INSERT INTO credit_basket (issuer, conid, description, coupon, maturity, valid_from, valid_to)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+                     ON CONFLICT(issuer, conid, valid_from) DO UPDATE SET valid_to = NULL",
+                    params![issuer, b.conid, b.description, b.coupon_pct, iso(b.maturity), iso(start)],
+                )
+                .map_err(|e| format!("credit_basket: {e}"))?;
+            }
+            written.extend(bonds.iter().map(|b| b.conid));
         }
-        for h in &outcome.histories {
-            // Volle Historie ersetzt die Reihe; ein Monatsnachtrag ergänzt sie nur, wenn die
-            // gespeicherte Reihe dieselbe Kursquelle hat, sonst würde sie Quellen mischen.
+        for h in outcome.histories.iter().filter(|h| written.contains(&h.conid)) {
             let stored_source: Option<String> = tx
                 .query_row("SELECT source FROM bond_prices WHERE conid = ?1 LIMIT 1", params![h.conid], |r| r.get(0))
                 .optional()
                 .map_err(|e| format!("bond_prices: {e}"))?;
-            if !h.full && stored_source.as_deref() != Some(h.source.as_str()) {
+            let same_source = stored_source.as_deref() == Some(h.source.as_str());
+            // Ein Monatsnachtrag ergänzt nur eine Reihe derselben Quelle
+            if !h.full && !same_source {
                 continue;
             }
-            if h.full {
+            // Eine volle Historie aus anderer Quelle ersetzt die Reihe; aus derselben Quelle
+            // ergänzt sie, damit ältere Kurse jenseits des Jahresfensters erhalten bleiben.
+            if h.full && !same_source {
                 tx.execute("DELETE FROM bond_prices WHERE conid = ?1", params![h.conid])
                     .map_err(|e| format!("bond_prices: {e}"))?;
             }
@@ -174,14 +299,13 @@ impl ComputeStore {
                 tx.execute(
                     "INSERT INTO bond_prices (conid, date_iso, price, source) VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(conid, date_iso) DO UPDATE SET price = excluded.price, source = excluded.source",
-                    params![h.conid, d.format("%Y-%m-%d").to_string(), p, h.source],
+                    params![h.conid, iso(*d), p, h.source],
                 )
                 .map_err(|e| format!("bond_prices: {e}"))?;
                 rows += 1;
             }
         }
-        // Kurse nicht mehr ausgewählter Anleihen entfernen
-        tx.execute("DELETE FROM bond_prices WHERE conid NOT IN (SELECT conid FROM credit_bonds)", [])
+        tx.execute("DELETE FROM bond_prices WHERE conid NOT IN (SELECT conid FROM credit_basket)", [])
             .map_err(|e| format!("bond_prices: {e}"))?;
         tx.commit().map_err(|e| format!("IB-Daten: {e}"))?;
         Ok(rows)
@@ -193,8 +317,11 @@ impl ComputeStore {
 
     fn load_bond_selection_in(conn: &Connection) -> Result<BTreeMap<String, Vec<SelectedBond>>, String> {
         let mut stmt = conn
-            .prepare("SELECT issuer, conid, description, coupon, maturity FROM credit_bonds ORDER BY issuer, maturity")
-            .map_err(|e| format!("credit_bonds: {e}"))?;
+            .prepare(
+                "SELECT issuer, conid, description, coupon, maturity FROM credit_basket
+                 WHERE valid_to IS NULL ORDER BY issuer, maturity",
+            )
+            .map_err(|e| format!("credit_basket: {e}"))?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -205,7 +332,7 @@ impl ComputeStore {
                     r.get::<_, String>(4)?,
                 ))
             })
-            .map_err(|e| format!("credit_bonds: {e}"))?;
+            .map_err(|e| format!("credit_basket: {e}"))?;
         let mut out: BTreeMap<String, Vec<SelectedBond>> = BTreeMap::new();
         for (issuer, conid, description, coupon_pct, maturity) in rows.flatten() {
             if let Some(maturity) = parse_date(&maturity) {
@@ -215,6 +342,62 @@ impl ComputeStore {
                     coupon_pct,
                     maturity,
                 });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Alle Korbeinträge je Emittent, eine Anleihe mit allen ihren Zeiträumen.
+    fn load_basket_in(conn: &Connection) -> Result<BTreeMap<String, Vec<BasketBond>>, String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT issuer, conid, description, coupon, maturity, valid_from, valid_to FROM credit_basket
+                 ORDER BY issuer, maturity, conid, valid_from",
+            )
+            .map_err(|e| format!("credit_basket: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i32>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| format!("credit_basket: {e}"))?;
+        let mut out: BTreeMap<String, Vec<BasketBond>> = BTreeMap::new();
+        for (issuer, conid, description, coupon_pct, maturity, from, to) in rows.flatten() {
+            let (Some(maturity), Some(from)) = (parse_date(&maturity), parse_date(&from)) else {
+                continue;
+            };
+            let interval: BasketInterval = (from, to.as_deref().and_then(parse_date));
+            let list = out.entry(issuer).or_default();
+            match list.iter_mut().find(|b| b.bond.conid == conid) {
+                Some(b) => b.active.push(interval),
+                None => list.push(BasketBond {
+                    bond: SelectedBond { conid, description, coupon_pct, maturity },
+                    active: vec![interval],
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Agenturratings je Emittent ab Gültigkeitsbeginn, aufsteigend.
+    fn load_ratings_in(conn: &Connection) -> Result<BTreeMap<String, Vec<(NaiveDate, String)>>, String> {
+        let mut stmt = conn
+            .prepare("SELECT issuer, valid_from, rating FROM credit_ratings ORDER BY issuer, valid_from")
+            .map_err(|e| format!("credit_ratings: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+            .map_err(|e| format!("credit_ratings: {e}"))?;
+        let mut out: BTreeMap<String, Vec<(NaiveDate, String)>> = BTreeMap::new();
+        for (issuer, from, rating) in rows.flatten() {
+            if let Some(from) = parse_date(&from) {
+                out.entry(issuer).or_default().push((from, rating));
             }
         }
         Ok(out)
@@ -273,21 +456,23 @@ impl ComputeStore {
 
     fn load_curve_days_in(conn: &Connection, gpu: &str, from: NaiveDate) -> Result<Vec<CurveDay>, String> {
         // Nur eine Zeile je Tag aus SQLite holen (live vor Backfill, dann die neueste), statt alle
-        // 15-Minuten-Stände der letzten 48 Stunden samt Kurven-JSON zu laden.
+        // 15-Minuten-Stände der letzten 48 Stunden samt Kurven-JSON zu laden. Die Auswahl läuft
+        // ohne das JSON; erst die Gewinnerzeilen lesen es.
         let mut stmt = conn
             .prepare(
-                "SELECT snapshot_date, spot_price, expiries_json FROM (
-                     SELECT snapshot_date, spot_price, expiries_json,
-                            ROW_NUMBER() OVER (
+                "SELECT c.snapshot_date, c.spot_price, c.expiries_json
+                 FROM curve_snapshots c
+                 JOIN (
+                     SELECT id, ROW_NUMBER() OVER (
                                 PARTITION BY snapshot_date
                                 ORDER BY CASE snapshot_kind WHEN 'live' THEN 1 ELSE 0 END DESC,
                                          captured_at DESC, id DESC
                             ) AS rn
                      FROM curve_snapshots
                      WHERE gpu = ?1 AND snapshot_date >= ?2
-                 )
-                 WHERE rn = 1
-                 ORDER BY snapshot_date",
+                 ) w ON w.id = c.id
+                 WHERE w.rn = 1
+                 ORDER BY c.snapshot_date",
             )
             .map_err(|e| format!("curve_snapshots: {e}"))?;
         let rows = stmt
@@ -340,15 +525,22 @@ impl ComputeStore {
         let (treasury, oas): (BTreeMap<String, Series>, BTreeMap<String, Series>) =
             all.into_iter().partition(|(k, _)| is_treasury_series(k));
 
-        let selection = Self::load_bond_selection_in(&tx)?;
+        let basket = Self::load_basket_in(&tx)?;
+        let ratings = Self::load_ratings_in(&tx)?;
         let mut issuers = Vec::new();
         let mut infos = Vec::new();
         for iss in settings.issuers.iter().filter(|i| i.enabled) {
-            let bonds = selection.get(&iss.key).cloned().unwrap_or_default();
-            let conids: Vec<i32> = bonds.iter().map(|b| b.conid).collect();
+            let members = basket.get(&iss.key).cloned().unwrap_or_default();
+            let conids: Vec<i32> = members.iter().map(|b| b.bond.conid).collect();
             let prices = Self::load_bond_prices_in(&tx, &conids)?;
             let price_series: BTreeMap<i32, Series> = prices.iter().map(|(k, (s, _))| (*k, s.clone())).collect();
-            let spreads = issuer_spread_series(&bonds, &price_series, &treasury);
+            let spreads = issuer_spread_series(&members, &price_series, &treasury);
+            // Angezeigt wird der aktuelle Korb; der Verlauf nutzt alle früheren Mitglieder
+            let bonds: Vec<SelectedBond> = members
+                .iter()
+                .filter(|b| b.active.iter().any(|(_, to)| to.is_none()))
+                .map(|b| b.bond.clone())
+                .collect();
             for b in &bonds {
                 let (last, source) = prices
                     .get(&b.conid)
@@ -367,6 +559,8 @@ impl ComputeStore {
                 key: iss.key.clone(),
                 label: iss.label.clone(),
                 agency_rating: iss.agency_rating.clone(),
+                ratings: ratings.get(&iss.key).cloned().unwrap_or_default(),
+                members: spreads.members,
                 spreads_bp: spreads.level,
                 linked_bp: spreads.linked,
                 bonds: bonds.iter().map(|b| b.description.clone()).collect(),
@@ -424,9 +618,23 @@ mod tests {
         assert!(all["UST2Y"].is_empty());
     }
 
+    fn xyz_settings(store: &ComputeStore, rating: &str, today: NaiveDate) {
+        let s = CreditSettings {
+            issuers: vec![crate::credit_fetch::IssuerSettings {
+                key: "XYZ".into(),
+                label: "XYZ".into(),
+                agency_rating: rating.into(),
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        store.save_credit_settings(&s, today).unwrap();
+    }
+
     #[test]
-    fn ib_outcome_replaces_selection_and_drops_orphans() {
+    fn ib_outcome_keeps_basket_history_and_never_mixes_sources() {
         let store = temp_store("ib");
+        xyz_settings(&store, "BBB", d(2026, 11, 1));
         let bond = |conid, y| SelectedBond {
             conid,
             description: format!("XYZ 5 01/15/{y}"),
@@ -443,22 +651,22 @@ mod tests {
         first.selections.insert("XYZ".into(), vec![bond(1, 31), bond(2, 33)]);
         first.histories.push(hist(1, "mid", vec![(d(2026, 11, 20), 99.0)], true));
         first.histories.push(hist(2, "bid", vec![(d(2026, 11, 20), 97.0)], true));
-        store.save_ib_outcome(&first).unwrap();
+        store.save_ib_outcome(&first, d(2026, 11, 20)).unwrap();
 
         // Monatsnachtrag mit anderer Quelle wird verworfen, volle Historie ersetzt
         let mut second = IbFetchOutcome::default();
         second.selections.insert("XYZ".into(), vec![bond(1, 31), bond(3, 34)]);
         second.histories.push(hist(1, "bid", vec![(d(2026, 11, 21), 98.0)], false));
-        store.save_ib_outcome(&second).unwrap();
+        store.save_ib_outcome(&second, d(2026, 11, 22)).unwrap();
         assert_eq!(store.load_bond_prices(&[1]).unwrap()[&1].1, "mid");
         second.histories[0].full = true;
-        store.save_ib_outcome(&second).unwrap();
+        store.save_ib_outcome(&second, d(2026, 11, 22)).unwrap();
 
         // Gleiche Quelle: Nachtrag ergänzt und überschreibt den Tag
         let mut third = IbFetchOutcome::default();
         third.selections.insert("XYZ".into(), vec![bond(1, 31), bond(3, 34)]);
         third.histories.push(hist(1, "bid", vec![(d(2026, 11, 21), 98.5), (d(2026, 11, 22), 98.7)], false));
-        store.save_ib_outcome(&third).unwrap();
+        store.save_ib_outcome(&third, d(2026, 11, 22)).unwrap();
 
         let sel = store.load_bond_selection().unwrap();
         let ids: Vec<i32> = sel["XYZ"].iter().map(|b| b.conid).collect();
@@ -467,10 +675,69 @@ mod tests {
         assert_eq!(prices[&1].0.len(), 2);
         assert_eq!(prices[&1].0[&d(2026, 11, 21)], 98.5);
         assert_eq!(prices[&1].1, "bid");
-        // Anleihe 2 ist nicht mehr im Korb, ihre Kurse sind entfernt
-        assert!(!prices.contains_key(&2));
+        // Anleihe 2 ist ausgeschieden, ihre Kurse bleiben für den Verlauf
+        assert_eq!(prices[&2].0[&d(2026, 11, 20)], 97.0);
+        let basket = ComputeStore::load_basket_in(&store.connect().unwrap()).unwrap();
+        let of = |c: i32| basket["XYZ"].iter().find(|b| b.bond.conid == c).unwrap().active.clone();
+        assert_eq!(of(1), vec![(EARLIEST, None)]);
+        assert_eq!(of(2), vec![(EARLIEST, Some(d(2026, 11, 21)))]);
+        assert_eq!(of(3), vec![(d(2026, 11, 22), None)]);
         let stored = store.load_stored_bonds().unwrap();
         assert_eq!(stored[&1].last_date, d(2026, 11, 22));
+    }
+
+    #[test]
+    fn removed_issuers_are_cleaned_and_not_written_back() {
+        let store = temp_store("removed");
+        xyz_settings(&store, "BBB", d(2026, 11, 1));
+        let bond = SelectedBond { conid: 7, description: "XYZ 5 01/15/31".into(), coupon_pct: 5.0, maturity: d(2031, 1, 15) };
+        let mut outcome = IbFetchOutcome::default();
+        outcome.selections.insert("XYZ".into(), vec![bond]);
+        outcome.histories.push(BondPriceHistory { conid: 7, source: "bid".into(), prices: vec![(d(2026, 11, 20), 99.0)], full: true });
+        store.save_ib_outcome(&outcome, d(2026, 11, 20)).unwrap();
+        // Ausschalten behält die Daten
+        let mut s = store.load_credit_settings();
+        s.issuers[0].enabled = false;
+        store.save_credit_settings(&s, d(2026, 11, 21)).unwrap();
+        assert!(store.load_bond_prices(&[7]).unwrap().contains_key(&7));
+        // Entfernen löscht sie, und ein spät fertiger Abruf legt sie nicht wieder an
+        s.issuers.clear();
+        store.save_credit_settings(&s, d(2026, 11, 21)).unwrap();
+        assert!(store.load_bond_prices(&[7]).unwrap().is_empty());
+        store.save_ib_outcome(&outcome, d(2026, 11, 21)).unwrap();
+        assert!(store.load_bond_selection().unwrap().is_empty());
+        assert!(store.load_bond_prices(&[7]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rating_changes_apply_from_the_day_of_the_change() {
+        let store = temp_store("ratings");
+        xyz_settings(&store, "BBB", d(2026, 11, 1));
+        xyz_settings(&store, "BB+", d(2026, 11, 20));
+        xyz_settings(&store, "BB+", d(2026, 11, 21));
+        let ratings = ComputeStore::load_ratings_in(&store.connect().unwrap()).unwrap();
+        assert_eq!(
+            ratings["XYZ"],
+            vec![(EARLIEST, "BBB".to_string()), (d(2026, 11, 20), "BB+".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_first_basket_migrates_with_full_history() {
+        let store = temp_store("migrate");
+        let conn = store.connect().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credit_bonds (issuer TEXT NOT NULL, conid INTEGER NOT NULL, description TEXT NOT NULL,
+                 coupon REAL NOT NULL, maturity TEXT NOT NULL, PRIMARY KEY (issuer, conid));
+             INSERT INTO credit_bonds VALUES ('XYZ', 7, 'XYZ 5 01/15/31', 5.0, '2031-01-15');",
+        )
+        .unwrap();
+        migrate_credit_tables(&conn).unwrap();
+        let basket = ComputeStore::load_basket_in(&conn).unwrap();
+        assert_eq!(basket["XYZ"][0].active, vec![(EARLIEST, None)]);
+        // Die alte Tabelle ist entfernt, eine zweite Migration ändert nichts
+        migrate_credit_tables(&conn).unwrap();
+        assert_eq!(ComputeStore::load_basket_in(&conn).unwrap(), basket);
     }
 
     #[test]
@@ -481,7 +748,7 @@ mod tests {
             ib_port: 7497,
             ..Default::default()
         };
-        store.save_credit_settings(&s).unwrap();
+        store.save_credit_settings(&s, d(2026, 11, 20)).unwrap();
         assert_eq!(store.load_credit_settings().ib_port, 7497);
     }
 

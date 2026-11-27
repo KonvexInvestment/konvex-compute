@@ -23,6 +23,8 @@ const FRED_CSV: &str = "https://fred.stlouisfed.org/graph/fredgraph.csv";
 /// FRED weist Kennungen ohne Kontaktadresse ab; Polymarket, Ornn und Treasury.gov
 /// behalten die bisherige Kennung der Software.
 const FRED_USER_AGENT: &str = "KonvexCompute/1.0 (+https://github.com/KonvexInvestment/konvex-compute)";
+/// So viele Tage nach Neujahr darf die Datei des neuen Jahres noch leer sein.
+const TREASURY_NEW_YEAR_GRACE_DAYS: u32 = 10;
 const TREASURY_CSV: &str = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv";
 /// Kennung, an der der Datenstand der Treasury-Kurve gemessen wird.
 pub const TREASURY_ANCHOR_SERIES: &str = "UST10Y";
@@ -283,20 +285,14 @@ pub async fn fetch_treasury_curve(
         let url = format!(
             "{TREASURY_CSV}/{year}/all?type=daily_treasury_yield_curve&field_tdr_date_value={year}&page&_format=csv"
         );
-        let parsed = match get_text_with_retry(client, &url, &format!("Treasury.gov {year}")).await {
-            Ok(body) => parse_treasury_csv(&body),
-            Err(e) => Err(e),
-        };
-        match parsed {
-            Ok(curve) => {
-                for (id, pts) in curve {
-                    out.entry(id).or_default().extend(pts.into_iter().filter(|(d, _)| *d >= from));
-                }
-            }
-            // Zu Jahresbeginn hat die Datei des neuen Jahres oft noch keine Zeilen: Dann
-            // zählen die Vorjahre, statt den ganzen Abruf zu verwerfen.
-            Err(_) if year == today.year() && out.values().any(|v| !v.is_empty()) => {}
-            Err(e) => return Err(e),
+        // HTTP- und Formatfehler zählen immer. Nur eine leere Datei des neuen Jahres in den
+        // ersten Januartagen heißt „noch keine Zeilen“; dann zählen die Vorjahre.
+        let body = get_text_with_retry(client, &url, &format!("Treasury.gov {year}")).await?;
+        if body.trim().is_empty() && year == today.year() && today.ordinal() <= TREASURY_NEW_YEAR_GRACE_DAYS {
+            continue;
+        }
+        for (id, pts) in parse_treasury_csv(&body)? {
+            out.entry(id).or_default().extend(pts.into_iter().filter(|(d, _)| *d >= from));
         }
     }
     Ok(out)
@@ -460,11 +456,13 @@ fn request_timeout(remaining: Duration, max: Duration) -> Option<Duration> {
 }
 
 /// Nach einem Abbruch wegen des Zeitbudgets: bisherige Anleihen, die nicht mehr geprüft
-/// wurden, bleiben mit ihren gespeicherten Kursen im Korb, statt beim Speichern zu verschwinden.
+/// wurden, bleiben mit ihren gespeicherten Kursen im Korb, sofern sie noch zulässig sind
+/// (weiter gelistet, keine Wandelanleihe, nicht zu kurz vor Fälligkeit).
 fn keep_unchecked(
     chosen: &mut Vec<SelectedBond>,
     prev: &[SelectedBond],
     examined: &std::collections::BTreeSet<i32>,
+    eligible: &std::collections::BTreeSet<i32>,
     stored: &BTreeMap<i32, StoredBond>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
@@ -472,7 +470,11 @@ fn keep_unchecked(
         if chosen.len() >= BONDS_PER_ISSUER {
             break;
         }
-        if examined.contains(&b.conid) || chosen.iter().any(|c| c.conid == b.conid) || !stored.contains_key(&b.conid) {
+        if examined.contains(&b.conid)
+            || !eligible.contains(&b.conid)
+            || chosen.iter().any(|c| c.conid == b.conid)
+            || !stored.contains_key(&b.conid)
+        {
             continue;
         }
         chosen.push(b.clone());
@@ -556,6 +558,14 @@ pub async fn fetch_ib_bonds(
             let Some(contract) = contracts.get(&bond.conid) else {
                 continue;
             };
+            let known = prev.iter().any(|b| b.conid == bond.conid)
+                .then(|| stored.get(&bond.conid))
+                .flatten()
+                .filter(|s| s.source == BOND_PRICE_SOURCE);
+            // Erst prüfen, ob noch ein Versuch erlaubt ist, dann Kontingent belegen
+            if known.is_none() && new_tries >= IB_MAX_NEW_TRIES_PER_ISSUER {
+                break;
+            }
             if !pacer.ready(deadline).await {
                 aborted = true;
                 break;
@@ -564,10 +574,6 @@ pub async fn fetch_ib_bonds(
                 aborted = true;
                 break;
             };
-            let known = prev.iter().any(|b| b.conid == bond.conid)
-                .then(|| stored.get(&bond.conid))
-                .flatten()
-                .filter(|s| s.source == BOND_PRICE_SOURCE);
             if let Some(known) = known {
                 examined.insert(bond.conid);
                 match fetch_bid_bars(&client, contract, 1.months(), month_timeout).await {
@@ -580,20 +586,23 @@ pub async fn fetch_ib_bonds(
                         });
                         chosen.push(bond.clone());
                     }
-                    result => {
-                        let why = result.err().unwrap_or_else(|| "keine neuen Kurse".into());
+                    // Zeitlimit, Verbindungs- oder Pacing-Fehler: ungeklärt, die Anleihe bleibt
+                    Err(e) => {
+                        chosen.push(bond.clone());
+                        skipped.push(format!("{} ohne Nachtrag ({e})", bond.description));
+                    }
+                    // Erfolgreiche, aber leere Antwort: Nach KEEP_WITHOUT_UPDATE_DAYS ohne Kurse
+                    // wird die Anleihe ersetzt; ihre Kurse bleiben für den Verlauf gespeichert.
+                    Ok(_) => {
                         if (today - known.last_date).num_days() <= KEEP_WITHOUT_UPDATE_DAYS {
                             chosen.push(bond.clone());
-                            skipped.push(format!("{} ohne Nachtrag ({why})", bond.description));
+                            skipped.push(format!("{} ohne Nachtrag (keine neuen Kurse)", bond.description));
                         } else {
-                            skipped.push(format!("{} ({why}, seit {} keine Kurse)", bond.description, known.last_date));
+                            skipped.push(format!("{} (seit {} keine Kurse)", bond.description, known.last_date));
                         }
                     }
                 }
             } else {
-                if new_tries >= IB_MAX_NEW_TRIES_PER_ISSUER {
-                    break;
-                }
                 new_tries += 1;
                 examined.insert(bond.conid);
                 let probe = fetch_bid_bars(&client, contract, 1.months(), month_timeout).await;
@@ -602,6 +611,8 @@ pub async fn fetch_ib_bonds(
                         tokio::time::sleep(IB_REQUEST_GAP).await;
                         let paced = pacer.ready(deadline).await;
                         let Some(year_timeout) = request_timeout(remaining(), IB_YEAR_TIMEOUT).filter(|_| paced) else {
+                            // Nicht zu Ende geprüft: Eine bisherige Anleihe darf keep_unchecked behalten
+                            examined.remove(&bond.conid);
                             aborted = true;
                             break;
                         };
@@ -626,7 +637,8 @@ pub async fn fetch_ib_bonds(
             tokio::time::sleep(IB_REQUEST_GAP).await;
         }
         if aborted {
-            skipped.extend(keep_unchecked(&mut chosen, prev, &examined, stored));
+            let eligible: std::collections::BTreeSet<i32> = candidates.iter().map(|c| c.conid).collect();
+            skipped.extend(keep_unchecked(&mut chosen, prev, &examined, &eligible, stored));
             out.errors.push(format!("IB {}: Zeitbudget erschöpft, Auswahl nur teilweise geprüft", iss.key));
         }
         if chosen.is_empty() {
@@ -668,15 +680,21 @@ mod tests {
         // Nur Anleihe 1 wurde geprüft, 3 hat keine gespeicherten Kurse
         let stored = BTreeMap::from([(1, stored_bond()), (2, stored_bond())]);
         let examined = std::collections::BTreeSet::from([1]);
+        let eligible = std::collections::BTreeSet::from([1, 2, 3]);
         let mut chosen = vec![bond(1)];
-        let notes = keep_unchecked(&mut chosen, &prev, &examined, &stored);
+        let notes = keep_unchecked(&mut chosen, &prev, &examined, &eligible, &stored);
         assert_eq!(chosen.iter().map(|b| b.conid).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(notes.len(), 1);
         // Geprüfte und verworfene Anleihen kommen nicht zurück
         let mut chosen = Vec::new();
         let examined = std::collections::BTreeSet::from([1, 2]);
-        keep_unchecked(&mut chosen, &prev, &examined, &stored);
+        keep_unchecked(&mut chosen, &prev, &examined, &eligible, &stored);
         assert!(chosen.is_empty());
+        // Nicht mehr zulässige Anleihen (etwa kurz vor Fälligkeit) auch nicht
+        let mut chosen = Vec::new();
+        let examined = std::collections::BTreeSet::new();
+        keep_unchecked(&mut chosen, &prev, &examined, &std::collections::BTreeSet::from([1]), &stored);
+        assert_eq!(chosen.iter().map(|b| b.conid).collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]
