@@ -63,6 +63,30 @@ CREATE TABLE IF NOT EXISTS meta_kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS credit_series (
+    series_id TEXT NOT NULL,
+    date_iso TEXT NOT NULL,
+    value REAL NOT NULL,
+    PRIMARY KEY (series_id, date_iso)
+);
+
+CREATE TABLE IF NOT EXISTS credit_bonds (
+    issuer TEXT NOT NULL,
+    conid INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    coupon REAL NOT NULL,
+    maturity TEXT NOT NULL,
+    PRIMARY KEY (issuer, conid)
+);
+
+CREATE TABLE IF NOT EXISTS bond_prices (
+    conid INTEGER NOT NULL,
+    date_iso TEXT NOT NULL,
+    price REAL NOT NULL,
+    source TEXT NOT NULL,
+    PRIMARY KEY (conid, date_iso)
+);
 "#;
 
 /// Live-Snapshots bleiben so lange vollständig erhalten (alle 15 Min.), danach nur der letzte je Tag.
@@ -94,7 +118,7 @@ impl ComputeStore {
         Ok(store)
     }
 
-    fn connect(&self) -> Result<Connection, String> {
+    pub(crate) fn connect(&self) -> Result<Connection, String> {
         let conn = Connection::open(&self.db_path)
             .map_err(|e| format!("SQLite-Verbindung fehlgeschlagen: {e}"))?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();

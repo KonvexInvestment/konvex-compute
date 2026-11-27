@@ -1,6 +1,10 @@
+pub mod credit;
+pub mod credit_fetch;
+pub mod credit_store;
 pub mod fetcher;
 pub mod math;
 pub mod models;
+pub mod regime;
 pub mod store;
 
 use crate::fetcher::{
@@ -11,8 +15,15 @@ use crate::models::{
     BackfillSummary, BusyState, ClobHistoryPoint, DashboardState, ExportResult, RefreshSummary,
     SnapshotDetail, StrikeHistoryResponse,
 };
+use crate::credit_fetch::{
+    build_fred_client, fetch_fred_series, fetch_ib_bonds, fetch_treasury_curve, fred_series_ids,
+    CreditSettings, FRED_HISTORY_DAYS, FRED_OVERLAP_DAYS, TREASURY_ANCHOR_SERIES,
+};
+use crate::credit_store::IssuerBondInfo;
+use crate::regime::{compute_regime, RegimeReport};
 use crate::store::ComputeStore;
 use reqwest::Client;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -25,6 +36,13 @@ const AUTO_REFRESH_MIN: u64 = 15;
 const AUTO_BACKFILL_MIN_AGE_HOURS: i64 = 20;
 /// Takt, in dem der Hintergrund-Poller die Fälligkeit gegen die Uhrzeit prüft.
 const SCHEDULER_TICK_SECS: u64 = 30;
+/// Kredit- und Anleihedaten ändern sich täglich: Abruf höchstens alle sechs Stunden.
+const CREDIT_REFRESH_HOURS: i64 = 6;
+/// Nach einem Fehlschlag frühestens nach dieser Zeit erneut versuchen.
+const CREDIT_RETRY_MIN: i64 = 30;
+/// Prüftakt des Kredit-Pollers.
+const CREDIT_TICK_SECS: u64 = 300;
+const GPU_KEYS_ALLOWED: [&str; 4] = ["H100", "H200", "B200", "B300"];
 
 /// True, wenn der RFC3339-Zeitstempel fehlt, unlesbar oder älter als `max_age` ist.
 fn is_older_than(ts: Option<&str>, max_age: chrono::Duration) -> bool {
@@ -47,13 +65,36 @@ fn unix_to_rfc3339(ts: i64) -> Option<String> {
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
+/// Stand der Kredit- und Anleiheabrufe für den Reiter Finanzierung.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreditStatus {
+    pub running: bool,
+    pub last_attempt_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub ib_last_success_at: Option<String>,
+    pub ib_status: Option<String>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FinanceView {
+    pub report: RegimeReport,
+    pub bonds: Vec<IssuerBondInfo>,
+    pub status: CreditStatus,
+    pub settings: CreditSettings,
+}
+
 pub struct AppState {
     pub store: ComputeStore,
     pub client: Client,
+    /// Eigener Client für FRED (Kennung mit Kontaktadresse, sonst weist FRED ab).
+    pub fred_client: Client,
     pub refreshing: AtomicBool,
     pub backfilling: AtomicBool,
+    pub crediting: AtomicBool,
     pub refresh_lock: Mutex<()>,
     pub backfill_lock: Mutex<()>,
+    pub credit_lock: Mutex<()>,
     pub strike_cache: Mutex<HashMap<(String, u32, u32), (Instant, Vec<ClobHistoryPoint>)>>,
     pub strike_inflight: Mutex<HashMap<(String, u32, u32), watch::Sender<bool>>>,
     /// Fälligkeit der nächsten automatischen Aktualisierung (Unix-Sekunden, 0 = sofort).
@@ -70,13 +111,17 @@ impl AppState {
     fn new() -> Result<Self, String> {
         let store = ComputeStore::open_default()?;
         let client = build_http_client()?;
+        let fred_client = build_fred_client()?;
         Ok(Self {
             store,
             client,
+            fred_client,
             refreshing: AtomicBool::new(false),
             backfilling: AtomicBool::new(false),
+            crediting: AtomicBool::new(false),
             refresh_lock: Mutex::new(()),
             backfill_lock: Mutex::new(()),
+            credit_lock: Mutex::new(()),
             strike_cache: Mutex::new(HashMap::new()),
             strike_inflight: Mutex::new(HashMap::new()),
             next_auto_refresh_ts: AtomicI64::new(0),
@@ -153,6 +198,142 @@ impl AppState {
         self.refreshing.store(false, Ordering::Relaxed);
         self.emit_busy();
         res
+    }
+
+    fn credit_status(&self) -> CreditStatus {
+        let meta = |k: &str| self.store.get_meta(k).ok().flatten();
+        CreditStatus {
+            running: self.crediting.load(Ordering::Relaxed),
+            last_attempt_at: meta("credit_last_attempt_at"),
+            last_success_at: meta("credit_last_success_at"),
+            ib_last_success_at: meta("ib_last_success_at"),
+            ib_status: meta("ib_last_status"),
+            errors: meta("credit_last_errors")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Fällig, wenn der letzte Erfolg älter als sechs Stunden ist und der letzte Versuch
+    /// nicht gerade erst scheiterte.
+    fn credit_due(&self) -> bool {
+        let st = self.credit_status();
+        is_older_than(
+            st.last_success_at.as_deref(),
+            chrono::Duration::hours(CREDIT_REFRESH_HOURS),
+        ) && is_older_than(
+            st.last_attempt_at.as_deref(),
+            chrono::Duration::minutes(CREDIT_RETRY_MIN),
+        )
+    }
+
+    /// Lädt die Treasury-Kurve (Treasury.gov), die OAS-Reihen (FRED) und, falls erreichbar,
+    /// Anleihekurse über IB.
+    async fn run_credit_refresh(&self) -> Result<CreditStatus, String> {
+        let Ok(_guard) = self.credit_lock.try_lock() else {
+            return Err("Kreditabruf läuft bereits.".into());
+        };
+        self.crediting.store(true, Ordering::Relaxed);
+        self.emit_credit();
+        let now = chrono::Utc::now();
+        let now_s = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let today = now.date_naive();
+        let mut errors = Vec::new();
+        let from_for = |id: &str| match self.store.latest_credit_date(id) {
+            Ok(Some(last)) => last - chrono::Duration::days(FRED_OVERLAP_DAYS),
+            _ => today - chrono::Duration::days(FRED_HISTORY_DAYS),
+        };
+
+        let mut treasury_ok = false;
+        match fetch_treasury_curve(&self.client, from_for(TREASURY_ANCHOR_SERIES), today).await {
+            Ok(curve) => {
+                treasury_ok = !curve.is_empty();
+                for (id, points) in &curve {
+                    if let Err(e) = self.store.save_credit_series(id, points) {
+                        errors.push(e);
+                        treasury_ok = false;
+                    }
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+
+        let mut fred_ok = 0usize;
+        for id in fred_series_ids() {
+            match fetch_fred_series(&self.fred_client, id, from_for(id)).await {
+                Ok(points) => match self.store.save_credit_series(id, &points) {
+                    Ok(_) => fred_ok += 1,
+                    Err(e) => errors.push(e),
+                },
+                Err(e) => errors.push(e),
+            }
+        }
+
+        let settings = self.store.load_credit_settings();
+        if settings.ib_enabled {
+            let previous = self.store.load_bond_selection().unwrap_or_default();
+            let stored = self.store.load_stored_bonds().unwrap_or_default();
+            let outcome = fetch_ib_bonds(&settings, &previous, &stored, today).await;
+            let status = match outcome.port {
+                Some(port) => {
+                    let bonds: usize = outcome.selections.values().map(Vec::len).sum();
+                    format!(
+                        "Verbunden über Port {port}: {bonds} Anleihen im Korb, {} Kursreihen geladen, {} übersprungen",
+                        outcome.histories.len(),
+                        outcome.skipped.len()
+                    )
+                }
+                None => "Keine Verbindung zu TWS oder IB Gateway".to_string(),
+            };
+            let _ = self.store.set_meta("ib_last_status", &status);
+            if outcome.port.is_some() && !outcome.selections.is_empty() {
+                match self.store.save_ib_outcome(&outcome) {
+                    Ok(_) => {
+                        let _ = self.store.set_meta("ib_last_success_at", &now_s);
+                    }
+                    Err(e) => errors.push(e),
+                }
+            }
+            errors.extend(outcome.errors);
+        } else {
+            let _ = self.store.set_meta("ib_last_status", "IB-Abruf ausgeschaltet");
+        }
+
+        let _ = self.store.set_meta("credit_last_attempt_at", &now_s);
+        if fred_ok > 0 && treasury_ok {
+            let _ = self.store.set_meta("credit_last_success_at", &now_s);
+        }
+        let _ = self.store.set_meta(
+            "credit_last_errors",
+            &serde_json::to_string(&errors).unwrap_or_else(|_| "[]".into()),
+        );
+        self.crediting.store(false, Ordering::Relaxed);
+        self.emit_credit();
+        if fred_ok == 0 && !treasury_ok {
+            return Err(format!(
+                "Weder Zinskurve noch Kreditaufschläge abrufbar. {}",
+                errors.first().map(String::as_str).unwrap_or("")
+            ));
+        }
+        Ok(self.credit_status())
+    }
+
+    fn emit_credit(&self) {
+        if let Some(handle) = self.app_handle.get() {
+            let _ = handle.emit("compute:credit", self.credit_status());
+        }
+    }
+
+    fn finance_view(&self, gpu: &str) -> Result<FinanceView, String> {
+        let settings = self.store.load_credit_settings();
+        let today = chrono::Utc::now().date_naive();
+        let (inputs, bonds) = self.store.build_model_inputs(gpu, &settings, today)?;
+        Ok(FinanceView {
+            report: compute_regime(&inputs, today),
+            bonds,
+            status: self.credit_status(),
+            settings,
+        })
     }
 
     async fn run_backfill(&self, days: u32) -> Result<BackfillSummary, String> {
@@ -319,6 +500,36 @@ async fn export_csv(state: State<'_, Arc<AppState>>, gpu: String) -> Result<Expo
     Ok(ExportResult { ok: true, path, rows })
 }
 
+#[tauri::command]
+async fn get_finance_view(
+    state: State<'_, Arc<AppState>>,
+    gpu: String,
+) -> Result<FinanceView, String> {
+    let key = gpu.trim().to_uppercase();
+    if !GPU_KEYS_ALLOWED.contains(&key.as_str()) {
+        return Err("Unbekannte GPU.".into());
+    }
+    let st = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || st.finance_view(&key))
+        .await
+        .map_err(|e| format!("Berechnung abgebrochen: {e}"))?
+}
+
+#[tauri::command]
+async fn refresh_credit_now(state: State<'_, Arc<AppState>>) -> Result<CreditStatus, String> {
+    state.run_credit_refresh().await
+}
+
+#[tauri::command]
+async fn save_credit_settings(
+    state: State<'_, Arc<AppState>>,
+    settings: CreditSettings,
+) -> Result<CreditSettings, String> {
+    let clean = settings.validated()?;
+    state.store.save_credit_settings(&clean)?;
+    Ok(clean)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = Arc::new(AppState::new().expect("AppState konnte nicht erstellt werden"));
@@ -350,6 +561,18 @@ pub fn run() {
             let handle = app.handle().clone();
             let state = Arc::clone(&bg_state);
             let _ = state.app_handle.set(handle.clone());
+
+            // Kredit-Poller getrennt vom 15-Minuten-Takt: Ein langsamer IB-Abruf hält die Kurven nicht auf
+            let credit_state = Arc::clone(&bg_state);
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                loop {
+                    if credit_state.credit_due() {
+                        let _ = credit_state.run_credit_refresh().await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(CREDIT_TICK_SECS)).await;
+                }
+            });
             tauri::async_runtime::spawn(async move {
                 let initial = state.current_state().ok();
                 // Fälligkeit aus dem letzten Datenstand ableiten (ein Start-Abruf setzt sie neu)
@@ -422,6 +645,9 @@ pub fn run() {
             get_snapshot,
             get_strike_history,
             export_csv,
+            get_finance_view,
+            refresh_credit_now,
+            save_credit_settings,
         ])
         .run(tauri::generate_context!())
         .expect("Fehler beim Starten von Konvex Compute");
