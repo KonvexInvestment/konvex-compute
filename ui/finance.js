@@ -40,6 +40,7 @@ const fin = {
   seq: 0,
   status: null,
   running: false,
+  historyRunning: false, // Stufe 2 des IB-Abrufs: Korb steht, Kursverlauf wird nachgeladen
   settingsDirty: false,
   formRev: 0, // steigt mit jeder Eingabe im Formular
   shownSettings: null,
@@ -142,12 +143,14 @@ export function initFinance(deps) {
     const st = event && event.payload;
     if (!st) return;
     const wasRunning = fin.running;
+    const wasHistory = fin.historyRunning;
     fin.statusEpoch += 1;
     fin.status = st;
     fin.running = !!st.running;
+    fin.historyRunning = !!st.history_running;
     renderStatus();
-    // Nach einem Abruf (auch aus dem Hintergrund) neu rechnen
-    if (wasRunning && !fin.running) reloadIfActive();
+    // Nach jeder Stufe eines Abrufs (auch aus dem Hintergrund) neu rechnen
+    if ((wasRunning && !fin.running) || (wasHistory && !fin.historyRunning)) reloadIfActive();
   });
   deps.listen("compute:updated", reloadIfActive);
 }
@@ -176,6 +179,7 @@ async function load(gpu) {
     if (epoch === fin.statusEpoch) {
       fin.status = view.status;
       fin.running = !!view.status.running;
+      fin.historyRunning = !!view.status.history_running;
     }
     if (reqId !== fin.seq || fin.deps.getGpu() !== gpu || !fin.deps.isActive()) return;
     // Eine veraltete Antwort darf das Formular nicht mit alten Einstellungen füllen
@@ -193,19 +197,23 @@ async function load(gpu) {
 }
 
 async function triggerCreditRefresh() {
-  if (fin.running) return;
+  if (fin.running || fin.historyRunning) return;
   fin.running = true;
   // Ab hier zählt der lokale Status; ältere Antworten von get_finance_view überschreiben ihn nicht
   fin.statusEpoch += 1;
   const epoch = fin.statusEpoch;
   renderStatus();
-  fin.deps.showToast("Lade Zinskurve, Kreditaufschläge und Anleihekurse. Der erste IB-Abruf dauert einige Minuten.");
+  fin.deps.showToast(
+    "Lade Zinskurve, Kreditaufschläge und Anleihekurse. Der Anleihekorb steht nach wenigen Minuten, den längeren Kursverlauf lädt die Software danach im Hintergrund nach.",
+  );
   let alreadyRunning = false;
   try {
     const st = await fin.deps.invoke("refresh_credit_now");
-    fin.status = st;
+    // Seit dem Klick gemeldete Events sind neuer als diese Antwort
+    if (fin.statusEpoch === epoch) fin.status = st;
     const n = st.errors ? st.errors.length : 0;
-    fin.deps.showToast(n ? `Kreditdaten aktualisiert, ${n} Hinweis(e) im Datenstand.` : "Kreditdaten aktualisiert.");
+    const done = n ? `Kreditdaten aktualisiert, ${n} Hinweis(e) im Datenstand.` : "Kreditdaten aktualisiert.";
+    fin.deps.showToast(st.history_running ? `${done} Der Kursverlauf wird im Hintergrund nachgeladen.` : done);
   } catch (err) {
     alreadyRunning = String(err).includes("läuft bereits");
     if (alreadyRunning) fin.deps.showToast("Der Kreditabruf läuft bereits im Hintergrund.");
@@ -221,6 +229,7 @@ async function triggerCreditRefresh() {
       renderStatus();
     } else {
       fin.running = false;
+      fin.historyRunning = !!(fin.status && fin.status.history_running);
       renderStatus();
       reloadIfActive();
     }
@@ -434,19 +443,26 @@ function renderMacro(r) {
 function renderStatus() {
   const st = fin.status;
   const btn = $("fin-refresh-btn");
-  btn.disabled = fin.running;
-  btn.classList.toggle("is-loading", fin.running);
-  btn.setAttribute("aria-busy", fin.running ? "true" : "false");
-  btn.querySelector(".ka-btn-label").textContent = fin.running ? "Abruf läuft …" : "Kreditdaten aktualisieren";
+  const busy = fin.running || fin.historyRunning;
+  btn.disabled = busy;
+  btn.classList.toggle("is-loading", busy);
+  btn.setAttribute("aria-busy", busy ? "true" : "false");
+  btn.querySelector(".ka-btn-label").textContent = fin.running
+    ? "Abruf läuft …"
+    : fin.historyRunning
+      ? "Verlauf lädt …"
+      : "Kreditdaten aktualisieren";
   if (!st) {
     $("fin-status").textContent = "";
     return;
   }
+  const ibNone = fin.running ? "wird abgefragt" : "noch nicht versucht";
   const parts = [
     `Zinskurve und Aufschläge: ${fmtTs(st.last_success_at)}`,
-    `IB: ${st.ib_status || "noch nicht versucht"}${st.ib_last_success_at ? ` (${fmtTs(st.ib_last_success_at)})` : ""}`,
+    `IB: ${st.ib_status || ibNone}${st.ib_last_success_at ? ` (${fmtTs(st.ib_last_success_at)})` : ""}`,
   ];
   if (fin.running) parts.unshift("Abruf läuft");
+  else if (fin.historyRunning) parts.unshift("Anleihekorb steht, Kursverlauf wird nachgeladen");
   $("fin-status").textContent = parts.join(" · ");
   const errs = st.errors || [];
   const ul = $("fin-errors");

@@ -11,6 +11,8 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 const SETTINGS_KEY: &str = "credit_settings";
+/// Anleihen, deren Verlauf IB vollständig geliefert hat (JSON-Liste der conids).
+const HISTORY_DONE_KEY: &str = "ib_history_done";
 /// Untergrenze beim Laden: vor allen Daten, die die Software speichern kann.
 const EARLIEST: NaiveDate = NaiveDate::from_ymd_opt(1990, 1, 1).unwrap();
 
@@ -424,19 +426,49 @@ impl ComputeStore {
         Ok(out)
     }
 
-    /// Kursquelle und letzter gespeicherter Tag je Anleihe.
+    /// Kursquelle, letzter gespeicherter Tag und Zahl der Handelstage je Anleihe.
     pub fn load_stored_bonds(&self) -> Result<BTreeMap<i32, StoredBond>, String> {
         let conn = self.connect()?;
         let mut stmt = conn
-            .prepare("SELECT conid, MIN(source), MAX(date_iso) FROM bond_prices GROUP BY conid")
+            .prepare("SELECT conid, MIN(source), MAX(date_iso), COUNT(*) FROM bond_prices GROUP BY conid")
             .map_err(|e| format!("bond_prices: {e}"))?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+            .query_map([], |r| {
+                Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            })
             .map_err(|e| format!("bond_prices: {e}"))?;
         Ok(rows
             .flatten()
-            .filter_map(|(conid, source, last)| Some((conid, StoredBond { source, last_date: parse_date(&last)? })))
+            .filter_map(|(conid, source, last, bars)| {
+                Some((conid, StoredBond { source, last_date: parse_date(&last)?, bars: bars.max(0) as usize }))
+            })
             .collect())
+    }
+
+    /// Anleihen, deren Verlauf IB schon vollständig geliefert hat (Stufe 2 fragt sie nicht erneut).
+    pub fn load_history_done(&self) -> std::collections::BTreeSet<i32> {
+        self.get_meta(HISTORY_DONE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Merkt sich Anleihen mit vollständig geliefertem Verlauf; Anleihen außerhalb des Korbs fallen heraus.
+    pub fn add_history_done(&self, conids: &[i32]) -> Result<(), String> {
+        let mut done = self.load_history_done();
+        done.extend(conids.iter().copied());
+        let conn = self.connect()?;
+        let in_basket: std::collections::BTreeSet<i32> = {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT conid FROM credit_basket")
+                .map_err(|e| format!("credit_basket: {e}"))?;
+            let rows = stmt.query_map([], |r| r.get::<_, i32>(0)).map_err(|e| format!("credit_basket: {e}"))?;
+            rows.flatten().collect()
+        };
+        done.retain(|c| in_basket.contains(c));
+        let json = serde_json::to_string(&done).map_err(|e| e.to_string())?;
+        self.set_meta(HISTORY_DONE_KEY, &json)
     }
 
     /// Tageskurse und Kursquelle je Anleihe.
@@ -811,5 +843,56 @@ mod tests {
         assert_eq!(days[0].spot, Some(1.7));
         assert_eq!(days[0].nodes[0].median, Some(2.2));
         assert_eq!(days[1].spot, Some(3.0));
+    }
+
+    #[test]
+    fn stage_two_extends_a_month_into_the_full_history() {
+        let store = temp_store("stage2");
+        xyz_settings(&store, "BBB", d(2026, 11, 1));
+        let bond = SelectedBond {
+            conid: 7,
+            description: "XYZ 5 01/15/31".into(),
+            coupon_pct: 5.0,
+            maturity: d(2031, 1, 15),
+        };
+        let days = |from: NaiveDate, n: i64, price: f64| -> Vec<(NaiveDate, f64)> {
+            (0..n).map(|i| (from + chrono::Duration::days(i), price)).collect()
+        };
+        // Stufe 1: neue Anleihe nur mit einem Monat, aber schon im Korb
+        let mut month = IbFetchOutcome::default();
+        month.selections.insert("XYZ".into(), vec![bond.clone()]);
+        month.histories.push(BondPriceHistory {
+            conid: 7,
+            source: "bid".into(),
+            prices: days(d(2026, 10, 28), 30, 90.0),
+            full: true,
+        });
+        store.save_ib_outcome(&month, d(2026, 11, 27)).unwrap();
+        assert_eq!(store.load_stored_bonds().unwrap()[&7].bars, 30);
+
+        // Stufe 2: Jahresverlauf derselben Quelle ergänzt; der Monat bleibt mit seinen Kursen
+        let mut year = IbFetchOutcome::default();
+        year.selections.insert("XYZ".into(), vec![bond.clone()]);
+        year.histories.push(BondPriceHistory {
+            conid: 7,
+            source: "bid".into(),
+            prices: days(d(2026, 6, 1), 100, 88.0),
+            full: true,
+        });
+        store.save_ib_outcome(&year, d(2026, 11, 27)).unwrap();
+        let stored = store.load_stored_bonds().unwrap();
+        assert_eq!(stored[&7].bars, 130);
+        assert_eq!(stored[&7].last_date, d(2026, 11, 26));
+        let prices = store.load_bond_prices(&[7]).unwrap();
+        assert_eq!(prices[&7].0[&d(2026, 6, 1)], 88.0);
+        assert_eq!(prices[&7].0[&d(2026, 11, 26)], 90.0);
+        // Der Korb bleibt unverändert: ein offener Eintrag über die ganze Historie
+        let basket = ComputeStore::load_basket_in(&store.connect().unwrap()).unwrap();
+        assert_eq!(basket["XYZ"].len(), 1);
+        assert_eq!(basket["XYZ"][0].active, vec![(EARLIEST, None)]);
+
+        // Vollständig geliefert: gemerkt, aber nur solange die Anleihe zum Korb gehört
+        store.add_history_done(&[7, 99]).unwrap();
+        assert_eq!(store.load_history_done(), std::collections::BTreeSet::from([7]));
     }
 }

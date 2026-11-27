@@ -43,21 +43,26 @@ pub const IB_CLIENT_ID_MAX: i32 = 999_999;
 const IB_HIST_PACING: (usize, Duration) = (55, Duration::from_secs(600));
 const IB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IB_DETAILS_TIMEOUT: Duration = Duration::from_secs(30);
-/// IB beantwortet Anleihehistorien langsam (ein Monat 5 bis 15 s, ein Jahr 35 bis 45 s)
-/// und für Anleihen ohne Historie oft gar nicht. Deshalb erst ein kurzer Monatsabruf als
-/// Probe, das volle Jahr nur einmal je neuer Anleihe, danach nur noch der letzte Monat.
-const IB_MONTH_TIMEOUT: Duration = Duration::from_secs(30);
-const IB_YEAR_TIMEOUT: Duration = Duration::from_secs(90);
+/// IB beantwortet Anleihehistorien langsam und arbeitet gleichzeitige Anfragen nacheinander
+/// ab: ein Monat braucht 5 bis 20 s, ein Jahr 35 s bis über drei Minuten. Der Abruf läuft
+/// deshalb in zwei Stufen. Stufe 1 stellt den Korb nur aus Monatsabrufen zusammen, Stufe 2
+/// lädt danach im Hintergrund den längeren Verlauf nach (siehe [`fetch_ib_histories`]).
+const IB_MONTH_TIMEOUT: Duration = Duration::from_secs(60);
+const IB_HISTORY_TIMEOUT: Duration = Duration::from_secs(300);
 /// Abstand zwischen historischen Anfragen (IB begrenzt auf 60 je 10 Minuten).
 const IB_REQUEST_GAP: Duration = Duration::from_millis(400);
-/// Höchstens so viele neue Anleihen je Emittent probieren, bis drei mit Historie gefunden sind.
+/// Höchstens so viele neue Anleihen je Emittent probieren, bis drei mit Kursen gefunden sind.
 const IB_MAX_NEW_TRIES_PER_ISSUER: usize = 5;
-/// Gesamtbudget eines IB-Abrufs über alle Emittenten (läuft im Hintergrund).
-const IB_TOTAL_BUDGET: Duration = Duration::from_secs(20 * 60);
+/// Zeitbudget der Stufe 1 (Korb und Monatskurse) über alle Emittenten.
+const IB_BASKET_BUDGET: Duration = Duration::from_secs(6 * 60);
+/// Zeitbudget der Stufe 2 (Verlauf nachladen); was offen bleibt, folgt beim nächsten Abruf.
+const IB_HISTORY_BUDGET: Duration = Duration::from_secs(12 * 60);
 /// Unter diesem Restbudget startet keine neue Anfrage mehr.
 const IB_MIN_REQUEST_BUDGET: Duration = Duration::from_secs(5);
-/// Mindestzahl an Handelstagen, damit eine Anleihe in den Korb kommt (etwa drei Monate).
-const MIN_HISTORY_BARS: usize = 60;
+/// Mindestzahl an Handelstagen im Monatsabruf, damit eine neue Anleihe in den Korb kommt.
+const MIN_PROBE_BARS: usize = 10;
+/// Ab so vielen gespeicherten Handelstagen (etwa drei Monate) lädt Stufe 2 keinen Verlauf nach.
+pub const HISTORY_TARGET_BARS: usize = 60;
 /// Eine bisherige Anleihe ohne neue Kurse bleibt so lange im Korb, danach wird neu gewählt.
 const KEEP_WITHOUT_UPDATE_DAYS: i64 = 14;
 /// Kursquelle der Anleihereihen: Geldkurs, für alle Anleihen gleich.
@@ -317,7 +322,8 @@ pub struct BondPriceHistory {
     /// Quelle der Tageskurse, siehe [`BOND_PRICE_SOURCE`].
     pub source: String,
     pub prices: Vec<(NaiveDate, f64)>,
-    /// true: volle Jahreshistorie, ersetzt die gespeicherte Reihe; false: Monatsnachtrag.
+    /// true: Kurse einer neuen Anleihe oder nachgeladener Verlauf; ersetzt eine gespeicherte
+    /// Reihe anderer Quelle. false: Nachtrag zu einer Reihe derselben Quelle.
     pub full: bool,
 }
 
@@ -326,6 +332,8 @@ pub struct BondPriceHistory {
 pub struct StoredBond {
     pub source: String,
     pub last_date: NaiveDate,
+    /// Zahl der gespeicherten Handelstage.
+    pub bars: usize,
 }
 
 #[derive(Debug, Default)]
@@ -333,9 +341,28 @@ pub struct IbFetchOutcome {
     pub port: Option<u16>,
     pub selections: BTreeMap<String, Vec<SelectedBond>>,
     pub histories: Vec<BondPriceHistory>,
+    /// Kontrakte der gewählten Anleihen, für das Nachladen des Verlaufs in Stufe 2.
+    pub contracts: BTreeMap<i32, Contract>,
     /// Übersprungene Anleihen (keine oder zu kurze Historie), nur zur Anzeige.
     pub skipped: Vec<String>,
     pub errors: Vec<String>,
+}
+
+/// Ergebnis der Stufe 2: nachgeladener Verlauf.
+#[derive(Debug, Default)]
+pub struct IbHistoryOutcome {
+    pub histories: Vec<BondPriceHistory>,
+    /// Anleihen, für die IB den Verlauf vollständig geliefert hat; Stufe 2 fragt sie nicht erneut.
+    pub done: Vec<i32>,
+    /// Anleihen ohne Antwort; der nächste Abruf versucht es erneut.
+    pub pending: Vec<String>,
+}
+
+/// Offene Verbindung zu TWS oder IB Gateway, mit dem Pacing beider Stufen.
+pub struct IbSession {
+    client: Client,
+    pub port: u16,
+    pacer: HistPacer,
 }
 
 /// Client-ID je Versuch: eine fest eingestellte ID bleibt immer dieselbe, sonst eine ID aus
@@ -362,6 +389,12 @@ async fn port_open(host: &str, port: u16) -> bool {
         tokio::time::timeout(Duration::from_secs(1), tokio::net::TcpStream::connect((host, port))).await,
         Ok(Ok(_))
     )
+}
+
+/// Verbindet mit TWS oder IB Gateway (Port 0: Standard-Ports der Reihe nach).
+pub async fn connect_ib_session(settings: &CreditSettings) -> Result<IbSession, String> {
+    let (client, port) = connect_ib(settings).await?;
+    Ok(IbSession { client, port, pacer: HistPacer::default() })
 }
 
 async fn connect_ib(settings: &CreditSettings) -> Result<(Client, u16), String> {
@@ -500,27 +533,20 @@ fn keep_unchecked(
     notes
 }
 
-/// Lädt Anleihelisten und Tageskurse von bis zu drei Anleihen je Emittent.
-/// Bekannte Anleihen bekommen nur den letzten Monat nach, neue erst eine Probe über
-/// einen Monat und dann ein volles Jahr.
+/// Stufe 1: Anleihelisten und Monatskurse von bis zu drei Anleihen je Emittent.
+/// Bekannte Anleihen bekommen den letzten Monat nach; eine neue kommt in den Korb, sobald
+/// ihr Monatsabruf mindestens [`MIN_PROBE_BARS`] Handelstage liefert. Den längeren Verlauf
+/// lädt danach [`fetch_ib_histories`] nach, ohne dass der Korb darauf wartet.
 pub async fn fetch_ib_bonds(
+    session: &mut IbSession,
     settings: &CreditSettings,
     previous: &BTreeMap<String, Vec<SelectedBond>>,
     stored: &BTreeMap<i32, StoredBond>,
     today: NaiveDate,
 ) -> IbFetchOutcome {
-    let mut out = IbFetchOutcome::default();
-    let (client, port) = match connect_ib(settings).await {
-        Ok(c) => c,
-        Err(e) => {
-            out.errors.push(format!("IB: {e}"));
-            return out;
-        }
-    };
-    out.port = Some(port);
-    let deadline = tokio::time::Instant::now() + IB_TOTAL_BUDGET;
+    let mut out = IbFetchOutcome { port: Some(session.port), ..Default::default() };
+    let deadline = tokio::time::Instant::now() + IB_BASKET_BUDGET;
     let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
-    let mut pacer = HistPacer::default();
     for iss in settings.issuers.iter().filter(|i| i.enabled) {
         let Some(details_timeout) = request_timeout(remaining(), IB_DETAILS_TIMEOUT) else {
             // Emittent bleibt unverändert: Ohne Eintrag in `selections` fasst das Speichern ihn nicht an
@@ -534,7 +560,7 @@ pub async fn fetch_ib_bonds(
             currency: "USD".into(),
             ..Default::default()
         };
-        let details = match tokio::time::timeout(details_timeout, client.contract_details(&query)).await {
+        let details = match tokio::time::timeout(details_timeout, session.client.contract_details(&query)).await {
             Ok(Ok(list)) => list,
             Ok(Err(e)) => {
                 out.errors.push(format!("IB {}: Anleiheliste nicht abrufbar ({e})", iss.key));
@@ -583,7 +609,7 @@ pub async fn fetch_ib_bonds(
             if known.is_none() && new_tries >= IB_MAX_NEW_TRIES_PER_ISSUER {
                 break;
             }
-            if !pacer.ready(deadline).await {
+            if !session.pacer.ready(deadline).await {
                 aborted = true;
                 break;
             }
@@ -591,9 +617,10 @@ pub async fn fetch_ib_bonds(
                 aborted = true;
                 break;
             };
+            examined.insert(bond.conid);
+            let month = fetch_bid_bars(&session.client, contract, 1.months(), month_timeout).await;
             if let Some(known) = known {
-                examined.insert(bond.conid);
-                match fetch_bid_bars(&client, contract, 1.months(), month_timeout).await {
+                match month {
                     Ok(prices) if !prices.is_empty() => {
                         out.histories.push(BondPriceHistory {
                             conid: bond.conid,
@@ -621,33 +648,19 @@ pub async fn fetch_ib_bonds(
                 }
             } else {
                 new_tries += 1;
-                examined.insert(bond.conid);
-                let probe = fetch_bid_bars(&client, contract, 1.months(), month_timeout).await;
-                match probe {
-                    Ok(p) if !p.is_empty() => {
-                        tokio::time::sleep(IB_REQUEST_GAP).await;
-                        let paced = pacer.ready(deadline).await;
-                        let Some(year_timeout) = request_timeout(remaining(), IB_YEAR_TIMEOUT).filter(|_| paced) else {
-                            // Nicht zu Ende geprüft: Eine bisherige Anleihe darf keep_unchecked behalten
-                            examined.remove(&bond.conid);
-                            aborted = true;
-                            break;
-                        };
-                        match fetch_bid_bars(&client, contract, 1.years(), year_timeout).await {
-                            Ok(prices) if prices.len() >= MIN_HISTORY_BARS => {
-                                out.histories.push(BondPriceHistory {
-                                    conid: bond.conid,
-                                    source: BOND_PRICE_SOURCE.into(),
-                                    prices,
-                                    full: true,
-                                });
-                                chosen.push(bond.clone());
-                            }
-                            Ok(prices) => skipped.push(format!("{} (erst {} Handelstage)", bond.description, prices.len())),
-                            Err(e) => skipped.push(format!("{} (Jahreshistorie: {e})", bond.description)),
-                        }
+                match month {
+                    Ok(prices) if prices.len() >= MIN_PROBE_BARS => {
+                        // Neue Anleihe: ersetzt eine gespeicherte Reihe anderer Quelle
+                        out.histories.push(BondPriceHistory {
+                            conid: bond.conid,
+                            source: BOND_PRICE_SOURCE.into(),
+                            prices,
+                            full: true,
+                        });
+                        chosen.push(bond.clone());
                     }
-                    Ok(_) => skipped.push(format!("{} (keine Kurse)", bond.description)),
+                    Ok(prices) if prices.is_empty() => skipped.push(format!("{} (keine Kurse)", bond.description)),
+                    Ok(prices) => skipped.push(format!("{} (erst {} Handelstage)", bond.description, prices.len())),
                     Err(e) => skipped.push(format!("{} ({e})", bond.description)),
                 }
             }
@@ -658,15 +671,77 @@ pub async fn fetch_ib_bonds(
             skipped.extend(keep_unchecked(&mut chosen, prev, &examined, &eligible, stored));
             out.errors.push(format!("IB {}: Zeitbudget erschöpft, Auswahl nur teilweise geprüft", iss.key));
         }
+        // Übersprungene zählen in der Statuszeile immer mit, auch wenn der Emittent leer bleibt
+        out.skipped.extend(skipped.iter().map(|s| format!("{} {s}", iss.key)));
         if chosen.is_empty() {
             let detail = if skipped.is_empty() { String::new() } else { format!(": {}", skipped.join(", ")) };
-            out.errors.push(format!("IB {}: keine Anleihe mit ausreichender Kurshistorie{detail}", iss.key));
+            out.errors.push(format!("IB {}: keine Anleihe mit Kursen{detail}", iss.key));
             continue;
         }
-        out.skipped.extend(skipped.into_iter().map(|s| format!("{} {s}", iss.key)));
+        for b in &chosen {
+            if let Some(c) = contracts.get(&b.conid) {
+                out.contracts.insert(b.conid, c.clone());
+            }
+        }
         out.selections.insert(iss.key.clone(), chosen);
     }
-    drop(client);
+    out
+}
+
+/// Anleihen des Korbs, deren Verlauf Stufe 2 nachladen soll: weniger als
+/// [`HISTORY_TARGET_BARS`] gespeicherte Handelstage und noch nicht vollständig geliefert.
+pub fn history_targets(
+    selections: &BTreeMap<String, Vec<SelectedBond>>,
+    stored: &BTreeMap<i32, StoredBond>,
+    done: &std::collections::BTreeSet<i32>,
+) -> Vec<SelectedBond> {
+    selections
+        .values()
+        .flatten()
+        .filter(|b| !done.contains(&b.conid))
+        .filter(|b| stored.get(&b.conid).map_or(0, |s| s.bars) < HISTORY_TARGET_BARS)
+        .cloned()
+        .collect()
+}
+
+/// Stufe 2: lädt für die Anleihen aus [`history_targets`] ein Jahr Tageskurse nach, eine
+/// nach der anderen, weil IB gleichzeitige Anfragen ohnehin nacheinander beantwortet.
+pub async fn fetch_ib_histories(
+    session: &mut IbSession,
+    targets: &[SelectedBond],
+    contracts: &BTreeMap<i32, Contract>,
+) -> IbHistoryOutcome {
+    let mut out = IbHistoryOutcome::default();
+    let deadline = tokio::time::Instant::now() + IB_HISTORY_BUDGET;
+    for bond in targets {
+        let Some(contract) = contracts.get(&bond.conid) else {
+            continue;
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(timeout) = request_timeout(remaining, IB_HISTORY_TIMEOUT) else {
+            out.pending.push(bond.description.clone());
+            continue;
+        };
+        if !session.pacer.ready(deadline).await {
+            out.pending.push(bond.description.clone());
+            continue;
+        }
+        match fetch_bid_bars(&session.client, contract, 1.years(), timeout).await {
+            // Auch eine kurze Antwort ist alles, was IB hat: nicht erneut fragen
+            Ok(prices) if !prices.is_empty() => {
+                out.done.push(bond.conid);
+                out.histories.push(BondPriceHistory {
+                    conid: bond.conid,
+                    source: BOND_PRICE_SOURCE.into(),
+                    prices,
+                    full: true,
+                });
+            }
+            // Leer, obwohl der Monat Kurse hatte: eher eine Störung bei IB, später erneut
+            Ok(_) | Err(_) => out.pending.push(bond.description.clone()),
+        }
+        tokio::time::sleep(IB_REQUEST_GAP).await;
+    }
     out
 }
 
@@ -676,9 +751,37 @@ mod tests {
 
     #[test]
     fn request_timeouts_never_exceed_the_remaining_budget() {
-        assert_eq!(request_timeout(Duration::from_secs(600), IB_YEAR_TIMEOUT), Some(IB_YEAR_TIMEOUT));
-        assert_eq!(request_timeout(Duration::from_secs(40), IB_YEAR_TIMEOUT), Some(Duration::from_secs(40)));
+        assert_eq!(request_timeout(Duration::from_secs(600), IB_HISTORY_TIMEOUT), Some(IB_HISTORY_TIMEOUT));
+        assert_eq!(request_timeout(Duration::from_secs(40), IB_HISTORY_TIMEOUT), Some(Duration::from_secs(40)));
         assert_eq!(request_timeout(Duration::from_secs(4), IB_MONTH_TIMEOUT), None);
+    }
+
+    #[test]
+    fn stage_two_loads_history_only_for_short_and_unfinished_series() {
+        let bond = |conid: i32| SelectedBond {
+            conid,
+            description: format!("X {conid}"),
+            coupon_pct: 5.0,
+            maturity: NaiveDate::from_ymd_opt(2031, 1, 1).unwrap(),
+        };
+        let stored = |bars: usize| StoredBond {
+            source: BOND_PRICE_SOURCE.into(),
+            last_date: NaiveDate::from_ymd_opt(2026, 11, 26).unwrap(),
+            bars,
+        };
+        let selections = BTreeMap::from([
+            ("A".to_string(), vec![bond(1), bond(2)]),
+            ("B".to_string(), vec![bond(3), bond(4)]),
+        ]);
+        // 1: nur ein Monat; 2: genug Verlauf; 3: IB hat schon alles geliefert; 4: noch nichts gespeichert
+        let stored = BTreeMap::from([
+            (1, stored(20)),
+            (2, stored(HISTORY_TARGET_BARS)),
+            (3, stored(16)),
+        ]);
+        let done = std::collections::BTreeSet::from([3]);
+        let targets = history_targets(&selections, &stored, &done);
+        assert_eq!(targets.iter().map(|b| b.conid).collect::<Vec<_>>(), vec![1, 4]);
     }
 
     #[test]
@@ -692,6 +795,7 @@ mod tests {
         let stored_bond = || StoredBond {
             source: BOND_PRICE_SOURCE.into(),
             last_date: NaiveDate::from_ymd_opt(2026, 11, 26).unwrap(),
+            bars: 120,
         };
         let prev = vec![bond(1), bond(2), bond(3)];
         // Nur Anleihe 1 wurde geprüft, 3 hat keine gespeicherten Kurse

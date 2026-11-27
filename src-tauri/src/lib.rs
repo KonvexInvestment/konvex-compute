@@ -15,9 +15,11 @@ use crate::models::{
     BackfillSummary, BusyState, ClobHistoryPoint, DashboardState, ExportResult, RefreshSummary,
     SnapshotDetail, StrikeHistoryResponse,
 };
+use crate::credit::SelectedBond;
 use crate::credit_fetch::{
-    build_fred_client, fetch_fred_series, fetch_ib_bonds, fetch_treasury_curve, fred_series_ids,
-    CreditSettings, FRED_HISTORY_DAYS, FRED_OVERLAP_DAYS, TREASURY_ANCHOR_SERIES,
+    build_fred_client, connect_ib_session, fetch_fred_series, fetch_ib_bonds, fetch_ib_histories,
+    fetch_treasury_curve, fred_series_ids, history_targets, CreditSettings, IbFetchOutcome, IbSession,
+    FRED_HISTORY_DAYS, FRED_OVERLAP_DAYS, TREASURY_ANCHOR_SERIES,
 };
 use crate::credit_store::IssuerBondInfo;
 use crate::regime::{compute_regime, RegimeReport};
@@ -29,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, OwnedMutexGuard};
 
 const AUTO_REFRESH_MIN: u64 = 15;
 /// Automatischer Backfill beim Start höchstens so oft (füllt auch Lücken nach Tagen ohne App).
@@ -93,11 +95,22 @@ fn unix_to_rfc3339(ts: i64) -> Option<String> {
 #[derive(Debug, Clone, Serialize)]
 pub struct CreditStatus {
     pub running: bool,
+    /// Stufe 2 des IB-Abrufs: Der Korb steht, der längere Kursverlauf wird nachgeladen.
+    pub history_running: bool,
     pub last_attempt_at: Option<String>,
     pub last_success_at: Option<String>,
     pub ib_last_success_at: Option<String>,
     pub ib_status: Option<String>,
     pub errors: Vec<String>,
+}
+
+/// Was Stufe 2 des IB-Abrufs aus Stufe 1 übernimmt: Verbindung, Korb, Kontrakte und Status.
+struct HistoryJob {
+    session: IbSession,
+    targets: Vec<SelectedBond>,
+    outcome: IbFetchOutcome,
+    status: String,
+    today: chrono::NaiveDate,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,9 +129,11 @@ pub struct AppState {
     pub refreshing: AtomicBool,
     pub backfilling: AtomicBool,
     pub crediting: AtomicBool,
+    pub history_loading: AtomicBool,
     pub refresh_lock: Mutex<()>,
     pub backfill_lock: Mutex<()>,
-    pub credit_lock: Mutex<()>,
+    /// Hält ein Kreditabruf samt Stufe 2 des IB-Abrufs, die im Hintergrund weiterläuft.
+    pub credit_lock: Arc<Mutex<()>>,
     pub strike_cache: Mutex<HashMap<(String, u32, u32), (Instant, Vec<ClobHistoryPoint>)>>,
     pub strike_inflight: Mutex<HashMap<(String, u32, u32), watch::Sender<bool>>>,
     /// Fälligkeit der nächsten automatischen Aktualisierung (Unix-Sekunden, 0 = sofort).
@@ -146,9 +161,10 @@ impl AppState {
             refreshing: AtomicBool::new(false),
             backfilling: AtomicBool::new(false),
             crediting: AtomicBool::new(false),
+            history_loading: AtomicBool::new(false),
             refresh_lock: Mutex::new(()),
             backfill_lock: Mutex::new(()),
-            credit_lock: Mutex::new(()),
+            credit_lock: Arc::new(Mutex::new(())),
             strike_cache: Mutex::new(HashMap::new()),
             strike_inflight: Mutex::new(HashMap::new()),
             next_auto_refresh_ts: AtomicI64::new(0),
@@ -232,6 +248,7 @@ impl AppState {
         let meta = |k: &str| self.store.get_meta(k).ok().flatten();
         CreditStatus {
             running: self.crediting.load(Ordering::Relaxed),
+            history_running: self.history_loading.load(Ordering::Relaxed),
             last_attempt_at: meta("credit_last_attempt_at"),
             last_success_at: meta("credit_last_success_at"),
             ib_last_success_at: meta("ib_last_success_at"),
@@ -259,8 +276,12 @@ impl AppState {
     /// Anleihekurse über IB. Automatische Läufe fragen IB nur ab, wenn der letzte IB-Erfolg
     /// älter als CREDIT_REFRESH_HOURS ist: Ein Teilfehler bei FRED wiederholt sonst alle
     /// CREDIT_RETRY_MIN Minuten den minutenlangen Anleiheabruf.
-    async fn run_credit_refresh(&self, manual: bool) -> Result<CreditStatus, String> {
-        let Ok(guard) = self.credit_lock.try_lock() else {
+    ///
+    /// Der IB-Abruf hat zwei Stufen: Stufe 1 stellt Korb und Monatskurse zusammen und kehrt
+    /// zurück; Stufe 2 lädt danach im Hintergrund den längeren Verlauf nach und hält die
+    /// Sperre bis zu ihrem Ende.
+    async fn run_credit_refresh(self: &Arc<Self>, manual: bool) -> Result<CreditStatus, String> {
+        let Ok(guard) = Arc::clone(&self.credit_lock).try_lock_owned() else {
             return Err("Kreditabruf läuft bereits.".into());
         };
         self.crediting.store(true, Ordering::Relaxed);
@@ -306,6 +327,14 @@ impl AppState {
             }
         }
 
+        // Zinskurve und Aufschläge sind gespeichert: Erfolg schon jetzt vermerken und melden,
+        // damit der Datenstand während des IB-Abrufs stimmt. Erfolg nur, wenn Zinskurve und
+        // alle OAS-Reihen da sind; sonst neuer Versuch nach CREDIT_RETRY_MIN.
+        if fred_ok == fred_ids.len() && treasury_ok {
+            let _ = self.store.set_meta("credit_last_success_at", &now_s);
+            self.emit_credit();
+        }
+
         let settings = self.store.load_credit_settings();
         let meta = |k: &str| self.store.get_meta(k).ok().flatten();
         // Automatisch höchstens alle CREDIT_REFRESH_HOURS nach einem Erfolg und alle
@@ -313,34 +342,49 @@ impl AppState {
         let ib_due = manual
             || (is_older_than(meta("ib_last_success_at").as_deref(), chrono::Duration::hours(CREDIT_REFRESH_HOURS))
                 && is_older_than(meta("ib_last_attempt_at").as_deref(), chrono::Duration::hours(IB_RETRY_HOURS)));
+        let mut stage_two: Option<HistoryJob> = None;
         if settings.ib_enabled && ib_due {
             let _ = self.store.set_meta("ib_last_attempt_at", &now_s);
-            let previous = self.store.load_bond_selection().unwrap_or_default();
-            let stored = self.store.load_stored_bonds().unwrap_or_default();
-            let outcome = fetch_ib_bonds(&settings, &previous, &stored, today).await;
-            let status = match outcome.port {
-                Some(port) => {
+            match connect_ib_session(&settings).await {
+                Err(e) => {
+                    let _ = self.store.set_meta("ib_last_status", "Keine Verbindung zu TWS oder IB Gateway");
+                    errors.push(format!("IB: {e}"));
+                }
+                Ok(mut session) => {
+                    let previous = self.store.load_bond_selection().unwrap_or_default();
+                    let stored = self.store.load_stored_bonds().unwrap_or_default();
+                    let outcome = fetch_ib_bonds(&mut session, &settings, &previous, &stored, today).await;
                     let bonds: usize = outcome.selections.values().map(Vec::len).sum();
-                    format!(
-                        "Verbunden über Port {port}: {bonds} Anleihen im Korb, {} Kursreihen geladen, {} übersprungen",
+                    let status = format!(
+                        "Verbunden über Port {}: {bonds} Anleihen im Korb, {} Kursreihen geladen, {} übersprungen",
+                        session.port,
                         outcome.histories.len(),
                         outcome.skipped.len()
-                    )
-                }
-                None => "Keine Verbindung zu TWS oder IB Gateway".to_string(),
-            };
-            let _ = self.store.set_meta("ib_last_status", &status);
-            if outcome.port.is_some() && !outcome.selections.is_empty() {
-                match self.store.save_ib_outcome(&outcome, today) {
-                    // Erfolg nur mit mindestens einer neu geladenen Kursreihe
-                    Ok(_) if !outcome.histories.is_empty() => {
-                        let _ = self.store.set_meta("ib_last_success_at", &now_s);
+                    );
+                    let _ = self.store.set_meta("ib_last_status", &status);
+                    let mut saved = false;
+                    if !outcome.selections.is_empty() {
+                        match self.store.save_ib_outcome(&outcome, today) {
+                            Ok(_) => {
+                                saved = true;
+                                // Erfolg nur mit mindestens einer neu geladenen Kursreihe
+                                if !outcome.histories.is_empty() {
+                                    let _ = self.store.set_meta("ib_last_success_at", &now_s);
+                                }
+                            }
+                            Err(e) => errors.push(e),
+                        }
                     }
-                    Ok(_) => {}
-                    Err(e) => errors.push(e),
+                    errors.extend(outcome.errors.iter().cloned());
+                    if saved {
+                        let stored = self.store.load_stored_bonds().unwrap_or_default();
+                        let targets = history_targets(&outcome.selections, &stored, &self.store.load_history_done());
+                        if !targets.is_empty() {
+                            stage_two = Some(HistoryJob { session, targets, outcome, status, today });
+                        }
+                    }
                 }
             }
-            errors.extend(outcome.errors);
         } else if settings.ib_enabled {
             // Anleihekurse sind aktuell genug; der Status des letzten IB-Laufs bleibt stehen
         } else {
@@ -350,22 +394,30 @@ impl AppState {
         // Versuch mit dem Endzeitpunkt: Nach einem langen Lauf beginnt der Wiederholungsabstand erst jetzt
         let end_s = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let _ = self.store.set_meta("credit_last_attempt_at", &end_s);
-        // Erfolg nur, wenn Zinskurve und alle OAS-Reihen da sind; sonst neuer Versuch nach
-        // CREDIT_RETRY_MIN statt erst nach CREDIT_REFRESH_HOURS.
-        if fred_ok == fred_ids.len() && treasury_ok {
-            let _ = self.store.set_meta("credit_last_success_at", &now_s);
-        }
         let _ = self.store.set_meta(
             "credit_last_errors",
             &serde_json::to_string(&errors).unwrap_or_else(|_| "[]".into()),
         );
+        if stage_two.is_some() {
+            self.history_loading.store(true, Ordering::Relaxed);
+        }
         self.crediting.store(false, Ordering::Relaxed);
         // Rückgabe noch unter der Sperre: Sie beschreibt diesen Lauf, nicht einen danach gestarteten
         let result = self.credit_status();
-        // Erst die Sperre freigeben, dann das Ende melden: Ein Klick nach dem Ende-Event
-        // bekommt so nie mehr „läuft bereits“.
-        drop(guard);
-        self.emit_credit();
+        match stage_two {
+            Some(job) => {
+                // Erst melden, dann Stufe 2 starten: Ihr Ende-Event kommt so immer danach
+                self.emit_credit();
+                let me = Arc::clone(self);
+                tauri::async_runtime::spawn(async move { me.load_bond_histories(guard, job).await });
+            }
+            None => {
+                // Erst die Sperre freigeben, dann das Ende melden: Ein Klick nach dem Ende-Event
+                // bekommt so nie mehr „läuft bereits“.
+                drop(guard);
+                self.emit_credit();
+            }
+        }
         if fred_ok == 0 && !treasury_ok {
             return Err(format!(
                 "Weder Zinskurve noch Kreditaufschläge abrufbar. {}",
@@ -373,6 +425,62 @@ impl AppState {
             ));
         }
         Ok(result)
+    }
+
+    /// Stufe 2 des IB-Abrufs: lädt den längeren Kursverlauf der Korbanleihen nach. Der Korb
+    /// bleibt unverändert; Emittenten, die inzwischen aus den Einstellungen entfernt wurden,
+    /// schreibt das Speichern nicht zurück.
+    async fn load_bond_histories(self: Arc<Self>, guard: OwnedMutexGuard<()>, job: HistoryJob) {
+        // Setzt die Anzeige „Verlauf lädt“ auch dann zurück, wenn diese Stufe unerwartet abbricht
+        struct ResetFlag<'a>(&'a AtomicBool);
+        impl Drop for ResetFlag<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetFlag(&self.history_loading);
+        let HistoryJob { mut session, targets, outcome, status, today } = job;
+        let fetched = fetch_ib_histories(&mut session, &targets, &outcome.contracts).await;
+        drop(session);
+        let loaded = fetched.histories.len();
+        let save = IbFetchOutcome {
+            port: outcome.port,
+            selections: outcome.selections,
+            histories: fetched.histories,
+            ..Default::default()
+        };
+        let mut errors: Vec<String> = self
+            .store
+            .get_meta("credit_last_errors")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        match self.store.save_ib_outcome(&save, today) {
+            Ok(_) => {
+                if let Err(e) = self.store.add_history_done(&fetched.done) {
+                    errors.push(e);
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+        if !fetched.pending.is_empty() {
+            errors.push(format!(
+                "IB: Kursverlauf noch nicht geladen für {} (IB antwortet nicht rechtzeitig), nächster Versuch beim nächsten Abruf",
+                fetched.pending.join(", ")
+            ));
+        }
+        let _ = self.store.set_meta(
+            "ib_last_status",
+            &format!("{status}; Verlauf für {loaded} von {} Anleihen nachgeladen", targets.len()),
+        );
+        let _ = self.store.set_meta(
+            "credit_last_errors",
+            &serde_json::to_string(&errors).unwrap_or_else(|_| "[]".into()),
+        );
+        self.history_loading.store(false, Ordering::Relaxed);
+        drop(guard);
+        self.emit_credit();
     }
 
     fn emit_credit(&self) {
