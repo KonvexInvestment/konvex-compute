@@ -12,28 +12,56 @@ const num2 = new Intl.NumberFormat("de-DE", { minimumFractionDigits: 2, maximumF
 const num1 = new Intl.NumberFormat("de-DE", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const intFmt = new Intl.NumberFormat("de-DE", { maximumFractionDigits: 0 });
 
+// Geschütztes Leerzeichen: Einheit bricht nie allein in die nächste Zeile
+const NBSP = "\u00a0";
+
+// Auf die angezeigten Stellen runden; aus -0,00 wird 0,00
+function roundShown(v, digits) {
+  const f = 10 ** digits;
+  const r = Math.round(v * f) / f;
+  return r === 0 ? 0 : r;
+}
+
+function isMissing(v) {
+  return v === null || v === undefined || Number.isNaN(v);
+}
+
 export function fmtUsd(v) {
-  if (v === null || v === undefined || Number.isNaN(v)) return "k. A.";
-  return `${num2.format(v)} $`;
+  if (isMissing(v)) return "k. A.";
+  return `${num2.format(roundShown(v, 2))}${NBSP}$`;
 }
 
 export function fmtSignedUsd(v) {
-  if (v === null || v === undefined || Number.isNaN(v)) return "k. A.";
-  const prefix = v > 0 ? "+" : "";
-  return `${prefix}${num2.format(v)} $`;
+  if (isMissing(v)) return "k. A.";
+  const r = roundShown(v, 2);
+  const prefix = r > 0 ? "+" : "";
+  return `${prefix}${num2.format(r)}${NBSP}$`;
 }
 
 export function fmtPct(v, signed = true) {
-  if (v === null || v === undefined || Number.isNaN(v)) return "k. A.";
-  const prefix = signed && v > 0 ? "+" : "";
-  return `${prefix}${num1.format(v)} %`;
+  if (isMissing(v)) return "k. A.";
+  const r = roundShown(v, 1);
+  const prefix = signed && r > 0 ? "+" : "";
+  return `${prefix}${num1.format(r)}${NBSP}%`;
+}
+
+export function fmtNum1(v) {
+  if (isMissing(v)) return "k. A.";
+  return num1.format(roundShown(v, 1));
+}
+
+export function fmtSignedNum1(v, unit) {
+  if (isMissing(v)) return "k. A.";
+  const r = roundShown(v, 1);
+  const prefix = r > 0 ? "+" : "";
+  return `${prefix}${num1.format(r)}${NBSP}${unit}`;
 }
 
 export function fmtCompactUsd(v) {
-  if (v === null || v === undefined || Number.isNaN(v)) return "k. A.";
-  if (v >= 1_000_000) return `${num2.format(v / 1_000_000)} Mio. $`;
-  if (v >= 1_000) return `${num1.format(v / 1_000)} Tsd. $`;
-  return `${intFmt.format(v)} $`;
+  if (isMissing(v)) return "k. A.";
+  if (v >= 1_000_000) return `${num2.format(v / 1_000_000)}${NBSP}Mio.${NBSP}$`;
+  if (v >= 1_000) return `${num1.format(v / 1_000)}${NBSP}Tsd.${NBSP}$`;
+  return `${intFmt.format(v)}${NBSP}$`;
 }
 
 export function escapeHtml(str) {

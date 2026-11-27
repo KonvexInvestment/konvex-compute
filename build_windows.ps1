@@ -1,8 +1,13 @@
 ﻿# Baut Konvex Compute unter Windows (Rust + Tauri 2) und installiert es auf Wunsch
 # für den aktuellen Benutzer, ohne Administratorrechte.
 #
-#   powershell -ExecutionPolicy Bypass -File .\build_windows.ps1            nur bauen
-#   powershell -ExecutionPolicy Bypass -File .\build_windows.ps1 -Install   bauen und installieren
+#   .\build_windows.ps1            nur bauen
+#   .\build_windows.ps1 -Install   bauen und installieren
+#
+# Voraussetzung: Ausführungsrichtlinie RemoteSigned für das eigene Konto
+# (Set-ExecutionPolicy -Scope CurrentUser RemoteSigned). Per git geklonte
+# Dateien laufen damit direkt; aus einem ZIP entpackte Dateien tragen eine
+# Download-Markierung und brauchen vorher einmal: Unblock-File .\build_windows.ps1
 
 param([switch]$Install)
 
@@ -52,3 +57,4 @@ $Shortcut.Save()
 
 Write-Host "Installiert: $DestExe"
 Write-Host "Startmenü: $ShortcutPath"
+exit 0

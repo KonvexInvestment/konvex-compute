@@ -1,6 +1,6 @@
 # Konvex Compute
 
-Lokale macOS-Software, die die GPU-Mietpreis-Märkte von Polymarket als Forward-Kurve darstellt, für H100, H200, B200 und B300. Startpunkt der Kurve ist der Ornn Compute Price Index (OCPI), auf den alle diese Polymarket-Märkte abrechnen.
+Lokale Software für macOS und Windows, die die GPU-Mietpreis-Märkte von Polymarket als Forward-Kurve darstellt, für H100, H200, B200 und B300. Startpunkt der Kurve ist der Ornn Compute Price Index (OCPI), auf den alle diese Polymarket-Märkte abrechnen.
 
 Beispielprojekt aus dem [KI-Lab von Konvex Investment](https://konvexinvestment.de/ki-lab/). Die erste Fassung entstand mit Gemini Neon in der Antigravity CLI, die Überarbeitung mit Claude Code (Opus 5.5) und einem Review durch Gemini Neon. Technik: Tauri 2, Rust und SQLite, ohne Python, Node.js oder npm.
 
@@ -20,6 +20,8 @@ Ein GPU-Mietpreis ist nach unten bei `0 $` begrenzt, nach oben offen. Ferne bin�
 
 ## Voraussetzungen
 
+### macOS
+
 - macOS 14 oder neuer (getestet mit macOS 27.2)
 - Apple Command Line Tools: `xcode-select --install`
 - Rust über rustup (getestet mit Rust 1.95):
@@ -28,7 +30,20 @@ Ein GPU-Mietpreis ist nach unten bei `0 $` begrenzt, nach oben offen. Ferne bin�
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Node.js, npm, Python und API-Schlüssel sind nicht nötig. Die Software ruft nur öffentliche Endpunkte ohne Anmeldung ab.
+### Windows
+
+- Windows 10 oder 11 auf x64 (getestet mit Windows 11)
+- Build Tools für Visual Studio mit der Workload „Desktopentwicklung mit C++“ (Compiler und Linker für Rust und SQLite)
+- Rust über rustup (getestet mit Rust 1.96), Toolchain `stable-x86_64-pc-windows-msvc`
+- WebView2-Runtime, unter Windows 11 vorinstalliert
+- PowerShell-Ausführungsrichtlinie für das eigene Konto: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+
+```powershell
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget install --id Rustlang.Rustup -e
+```
+
+Node.js, npm, Python und API-Schlüssel sind auf beiden Systemen nicht nötig. Die Software ruft nur öffentliche Endpunkte ohne Anmeldung ab.
 
 ## Bauen und installieren
 
@@ -39,41 +54,48 @@ git clone https://github.com/KonvexInvestment/konvex-compute.git
 cd konvex-compute
 ```
 
-Alternativ das ZIP von GitHub („Code“, „Download ZIP“) entpacken und im Terminal in den Ordner `konvex-compute-main` wechseln.
+Alternativ das ZIP von GitHub („Code“, „Download ZIP“) entpacken und im Terminal in den Ordner `konvex-compute-main` wechseln. Unter Windows tragen entpackte Dateien eine Download-Markierung; das Build-Skript braucht dann vorher einmal `Unblock-File .\build_windows.ps1`.
 
-Bauen und nach `/Applications/Konvex Compute.app` installieren:
+**macOS:** bauen und nach `/Applications/Konvex Compute.app` installieren:
 
 ```bash
 bash build_mac_app.sh --install
 ```
 
-Der erste Build lädt die Rust-Abhängigkeiten und dauert einige Minuten. Ohne `--install` bleibt das Ergebnis unter `src-tauri/target/release/bundle/macos/`. Die Unit-Tests laufen mit:
+**Windows (PowerShell):** bauen und nach `%LOCALAPPDATA%\Programs\Konvex Compute` installieren, mit Eintrag im Startmenü:
+
+```powershell
+.\build_windows.ps1 -Install
+```
+
+Der erste Build lädt die Rust-Abhängigkeiten und dauert einige Minuten. Ohne `--install` bzw. `-Install` bleibt das Ergebnis im Build-Ordner (`src-tauri/target/release/`). Die Unit-Tests laufen auf beiden Systemen mit:
 
 ```bash
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-Updates kommen per `git pull`, danach erneut `bash build_mac_app.sh --install`.
+Updates kommen per `git pull`, danach das Build-Skript erneut ausführen.
 
-## Gatekeeper
+## Gatekeeper und SmartScreen
 
-Das Build-Skript signiert die Software ad hoc, ohne Apple-Entwicklerzertifikat und ohne Notarisierung. Auf dem Mac, auf dem sie gebaut wurde, startet sie ohne Warnung, weil selbst gebaute Programme kein Quarantäne-Attribut tragen. Wird die fertige `.app` per Download, AirDrop oder Messenger auf einen anderen Mac übertragen, blockiert Gatekeeper sie. Deshalb gibt es kein fertiges Download-Paket, die Software wird auf jedem Mac aus dem Quellcode gebaut.
+Die Software ist weder von Apple notarisiert noch für Windows signiert. Auf dem Rechner, auf dem sie gebaut wurde, startet sie trotzdem ohne Warnung, weil selbst gebaute Programme keine Download-Markierung tragen. Wird die fertige `.app` oder `.exe` per Download, AirDrop oder Messenger auf einen anderen Rechner übertragen, blockiert Gatekeeper sie unter macOS, unter Windows warnt SmartScreen vor unbekannter Software. Deshalb gibt es kein fertiges Download-Paket, die Software wird auf jedem Rechner aus dem Quellcode gebaut.
 
 ## Lokale Daten
 
-Alle Daten liegen nur auf dem eigenen Mac:
+Alle Daten liegen nur auf dem eigenen Rechner:
 
-```text
-~/Library/Application Support/de.konvexinvestment.compute/compute.db
-```
+- macOS: `~/Library/Application Support/de.konvexinvestment.compute/compute.db`
+- Windows: `%APPDATA%\konvexinvestment\compute\data\compute.db`
 
-Zum vollständigen Entfernen genügt es, `/Applications/Konvex Compute.app` und diesen Ordner zu löschen.
+CSV-Exporte nutzen Komma als Trennzeichen und Punkt als Dezimalzeichen, also das internationale Format, das Python und pandas direkt lesen. Excel mit deutscher Ländereinstellung öffnet sie per Doppelklick einspaltig; dort ist ein Import mit Komma als Trennzeichen und Punkt als Dezimalzeichen nötig.
+
+Zum vollständigen Entfernen genügt es, die installierte Software (unter Windows zusätzlich den Startmenü-Eintrag) und den Datenordner zu löschen.
 
 ## Datenquellen und Bedingungen
 
-Die Software fragt alle Quellen direkt vom eigenen Mac ab, alle 15 Minuten, solange sie läuft. Das Repository enthält nur Code, keine Marktdaten.
+Die Software fragt alle Quellen direkt vom eigenen Rechner ab, alle 15 Minuten, solange sie läuft. Das Repository enthält nur Code, keine Marktdaten.
 
-- **Ornn Compute Price Index** ([data.ornn.com](https://data.ornn.com)), kostenlose API unter `api.ornnai.com`. Der OCPI ist der Abrechnungsindex aller Polymarket-GPU-Mietpreis-Märkte. Ornns [Nutzungsbedingungen](https://ornn.com/terms-of-use) erlauben die kostenlose API nur für die eigene private oder interne Nutzung und verlangen für das Speichern von Antworten und für abgeleitete Berechnungen eine schriftliche Erlaubnis. Ornn hat Konvex Investment im November 2026 schriftlich bestätigt, dass die Nutzung in dieser Software in Ordnung ist: Abruf vom eigenen Mac, Speicherung nur lokal, Vergleich mit der Forward-Kurve, Ornn als genannte Quelle. Eine Weitergabe der Daten ist davon nicht gedeckt, Datenbank und CSV-Exporte bleiben auf dem eigenen Rechner.
+- **Ornn Compute Price Index** ([data.ornn.com](https://data.ornn.com)), kostenlose API unter `api.ornnai.com`. Der OCPI ist der Abrechnungsindex aller Polymarket-GPU-Mietpreis-Märkte. Ornns [Nutzungsbedingungen](https://ornn.com/terms-of-use) erlauben die kostenlose API nur für die eigene private oder interne Nutzung und verlangen für das Speichern von Antworten und für abgeleitete Berechnungen eine schriftliche Erlaubnis. Ornn hat Konvex Investment im November 2026 schriftlich bestätigt, dass die Nutzung in dieser Software in Ordnung ist: Abruf vom eigenen Rechner, Speicherung nur lokal, Vergleich mit der Forward-Kurve, Ornn als genannte Quelle. Eine Weitergabe der Daten ist davon nicht gedeckt, Datenbank und CSV-Exporte bleiben auf dem eigenen Rechner.
 - **Polymarket** (Gamma API und CLOB API, `gamma-api.polymarket.com`, `clob.polymarket.com`): öffentliche Lese-Endpunkte ohne Konto. Es gelten die [Nutzungsbedingungen von Polymarket](https://polymarket.com/tos). Die Software liest nur Kurse und handelt nicht.
 
 ## Rahmen

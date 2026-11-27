@@ -1,7 +1,9 @@
 import {
   escapeHtml,
   fmtCompactUsd,
+  fmtNum1,
   fmtPct,
+  fmtSignedNum1,
   fmtSignedUsd,
   fmtUsd,
   renderCurveShiftChart,
@@ -200,9 +202,11 @@ function fmtDateShort(iso) {
   }).format(new Date(Date.UTC(y, m - 1, d)));
 }
 
-function deltaClass(v) {
+function deltaClass(v, digits = 2) {
   if (v === null || v === undefined) return "";
-  return v >= 0 ? "is-pos" : "is-neg";
+  // Werte, die auf die angezeigten Stellen zu 0 runden, nicht als Verlust einfärben
+  const f = 10 ** digits;
+  return Math.round(v * f) / f >= 0 ? "is-pos" : "is-neg";
 }
 
 function fmtAgo(iso) {
@@ -693,9 +697,9 @@ function renderDistributionAndStrikes(gpu, exp) {
     const pPct = s.prob_yes * 100;
     const pIso = s.prob_pava * 100;
     const bidAsk = s.best_bid !== null && s.best_ask !== null
-      ? `${(s.best_bid * 100).toFixed(1)} / ${(s.best_ask * 100).toFixed(1)}`
+      ? `${fmtNum1(s.best_bid * 100)} / ${fmtNum1(s.best_ask * 100)}`
       : "k. A.";
-    const spreadTxt = s.spread !== null ? `${(s.spread * 100).toFixed(1)} ct` : "k. A.";
+    const spreadTxt = s.spread !== null ? `${fmtNum1(s.spread * 100)}\u00a0ct` : "k. A.";
     const chg24 = s.one_day_change !== null ? s.one_day_change * 100 : null;
 
     tr.innerHTML = `
@@ -703,13 +707,13 @@ function renderDistributionAndStrikes(gpu, exp) {
       <td class="num">
         <span class="prob-cell">
           <span class="prob-track"><span class="prob-fill" style="width:${Math.min(100, Math.max(0, pPct)).toFixed(1)}%"></span></span>
-          <span>${pPct.toFixed(1)} %</span>
+          <span>${fmtPct(pPct, false)}</span>
         </span>
       </td>
-      <td class="num">${pIso.toFixed(1)} %</td>
+      <td class="num">${fmtPct(pIso, false)}</td>
       <td class="num">${bidAsk}</td>
       <td class="num">${spreadTxt}</td>
-      <td class="num ${deltaClass(chg24)}">${chg24 !== null ? `${chg24 >= 0 ? "+" : ""}${chg24.toFixed(1)} Pp` : "k. A."}</td>
+      <td class="num ${deltaClass(chg24, 1)}">${chg24 !== null ? fmtSignedNum1(chg24, "Pp") : "k. A."}</td>
       <td class="num">${fmtCompactUsd(s.liquidity)}</td>
       <td class="num">${fmtCompactUsd(s.volume_24h)}</td>
     `;
@@ -748,7 +752,7 @@ async function loadStrikeHistory(gpu, exp, strikeObj) {
       return;
     }
     const pts = res.history || [];
-    els.strikeHistorySub.textContent = `${pts.length} Stundenpunkte · Aktuell ${(strikeObj.prob_yes * 100).toFixed(1)} %`;
+    els.strikeHistorySub.textContent = `${pts.length} Stundenpunkte · Aktuell ${fmtPct(strikeObj.prob_yes * 100, false)}`;
     renderStrikeHistoryChart({ svg: els.strikeHistorySvg, points: pts, color: gpu.meta.color });
   } catch (err) {
     if (reqId !== state.strikeReqSeq) return;
@@ -1220,14 +1224,21 @@ function setupEvents() {
   });
 
   // Theme-Schalter (Konvex Dark Standard + Light Theme)
+  // Native Fensterleiste mitziehen (Windows-Titelleiste, macOS-Fensterdarstellung)
+  const syncWindowTheme = (theme) => {
+    const win = window.__TAURI__?.window?.getCurrentWindow?.();
+    win?.setTheme?.(theme)?.catch?.(() => {});
+  };
   const savedTheme = localStorage.getItem("konvex-compute-theme") || "dark";
   document.documentElement.dataset.theme = savedTheme;
+  syncWindowTheme(savedTheme);
   els.themeToggle.textContent = savedTheme === "dark" ? "Hell" : "Dunkel";
   els.themeToggle.addEventListener("click", () => {
     const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
     document.documentElement.dataset.theme = next;
     localStorage.setItem("konvex-compute-theme", next);
     els.themeToggle.textContent = next === "dark" ? "Hell" : "Dunkel";
+    syncWindowTheme(next);
   });
 
   let resizeTimer = null;
