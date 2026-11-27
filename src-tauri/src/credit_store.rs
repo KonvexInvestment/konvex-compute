@@ -2,7 +2,7 @@
 //! Zusammenstellen der Modelleingaben.
 
 use crate::credit::{is_treasury_series, issuer_spread_series, BasketBond, BasketInterval, SelectedBond};
-use crate::credit_fetch::{all_credit_series_ids, CreditSettings, IbFetchOutcome, StoredBond};
+use crate::credit_fetch::{all_credit_series_ids, BondPriceHistory, CreditSettings, IbFetchOutcome, StoredBond};
 use crate::regime::{CurveDay, CurveNode, IssuerSeries, ModelInputs, Series};
 use crate::store::ComputeStore;
 use chrono::NaiveDate;
@@ -13,6 +13,74 @@ use std::collections::BTreeMap;
 const SETTINGS_KEY: &str = "credit_settings";
 /// Anleihen, deren Verlauf IB vollständig geliefert hat (JSON-Liste der conids).
 const HISTORY_DONE_KEY: &str = "ib_history_done";
+
+/// Schreibt die Kurse einer Anleihe. Eine Reihe mischt nie Quellen: Ein Nachtrag ergänzt nur
+/// eine Reihe derselben Quelle, eine volle Reihe anderer Quelle ersetzt die gespeicherte.
+/// Tage in abgeschlossenen Korbzeiträumen sind schon in frühere Tageswerte eingegangen und
+/// bekommen aus derselben Quelle keine Kurse mehr, auch nicht in Lücken.
+fn write_history_tx(tx: &rusqlite::Transaction, h: &BondPriceHistory) -> Result<usize, String> {
+    let closed: Vec<(NaiveDate, NaiveDate)> = {
+        let mut stmt = tx
+            .prepare("SELECT valid_from, valid_to FROM credit_basket WHERE conid = ?1 AND valid_to IS NOT NULL")
+            .map_err(|e| format!("credit_basket: {e}"))?;
+        let rows = stmt
+            .query_map(params![h.conid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| format!("credit_basket: {e}"))?;
+        rows.flatten().filter_map(|(f, t)| Some((parse_date(&f)?, parse_date(&t)?))).collect()
+    };
+    let stored_source: Option<String> = tx
+        .query_row("SELECT source FROM bond_prices WHERE conid = ?1 LIMIT 1", params![h.conid], |r| r.get(0))
+        .optional()
+        .map_err(|e| format!("bond_prices: {e}"))?;
+    let same_source = stored_source.as_deref() == Some(h.source.as_str());
+    if !h.full && !same_source {
+        return Ok(0);
+    }
+    // Aus derselben Quelle ergänzt eine volle Reihe, damit ältere Kurse jenseits des
+    // Jahresfensters erhalten bleiben
+    if h.full && !same_source {
+        tx.execute("DELETE FROM bond_prices WHERE conid = ?1", params![h.conid])
+            .map_err(|e| format!("bond_prices: {e}"))?;
+    }
+    let mut rows = 0;
+    for (d, p) in &h.prices {
+        if same_source && closed.iter().any(|(f, t)| d >= f && d <= t) {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO bond_prices (conid, date_iso, price, source) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(conid, date_iso) DO UPDATE SET price = excluded.price, source = excluded.source",
+            params![h.conid, iso(*d), p, h.source],
+        )
+        .map_err(|e| format!("bond_prices: {e}"))?;
+        rows += 1;
+    }
+    Ok(rows)
+}
+
+/// Behält in der Marke „Verlauf vollständig“ nur Anleihen, die noch zum Korb gehören.
+fn prune_history_done_tx(tx: &rusqlite::Transaction) -> Result<(), String> {
+    let Some(json) = tx
+        .query_row("SELECT value FROM meta_kv WHERE key = ?1", params![HISTORY_DONE_KEY], |r| r.get::<_, String>(0))
+        .optional()
+        .map_err(|e| format!("meta_kv: {e}"))?
+    else {
+        return Ok(());
+    };
+    let mut done: std::collections::BTreeSet<i32> = serde_json::from_str(&json).unwrap_or_default();
+    let in_basket: std::collections::BTreeSet<i32> = {
+        let mut stmt = tx
+            .prepare("SELECT DISTINCT conid FROM credit_basket")
+            .map_err(|e| format!("credit_basket: {e}"))?;
+        let rows = stmt.query_map([], |r| r.get::<_, i32>(0)).map_err(|e| format!("credit_basket: {e}"))?;
+        rows.flatten().collect()
+    };
+    done.retain(|c| in_basket.contains(c));
+    let json = serde_json::to_string(&done).map_err(|e| e.to_string())?;
+    tx.execute("UPDATE meta_kv SET value = ?2 WHERE key = ?1", params![HISTORY_DONE_KEY, json])
+        .map_err(|e| format!("meta_kv: {e}"))?;
+    Ok(())
+}
 /// Untergrenze beim Laden: vor allen Daten, die die Software speichern kann.
 const EARLIEST: NaiveDate = NaiveDate::from_ymd_opt(1990, 1, 1).unwrap();
 
@@ -163,6 +231,9 @@ impl ComputeStore {
         }
         tx.execute("DELETE FROM bond_prices WHERE conid NOT IN (SELECT conid FROM credit_basket)", [])
             .map_err(|e| format!("bond_prices: {e}"))?;
+        // Mit den Kursen fällt auch die Marke „Verlauf vollständig“: Kommt die Anleihe zurück,
+        // lädt Stufe 2 ihren Verlauf erneut
+        prune_history_done_tx(&tx)?;
         tx.commit().map_err(|e| format!("Einstellungen: {e}"))
     }
 
@@ -289,47 +360,36 @@ impl ComputeStore {
             written.extend(bonds.iter().map(|b| b.conid));
         }
         for h in outcome.histories.iter().filter(|h| written.contains(&h.conid)) {
-            // Kurse in abgeschlossenen Korbzeiträumen sind schon in frühere Tageswerte eingegangen
-            // und bleiben unverändert, auch wenn ein Wiedereintritt eine volle Historie bringt.
-            let closed: Vec<(NaiveDate, NaiveDate)> = {
-                let mut stmt = tx
-                    .prepare("SELECT valid_from, valid_to FROM credit_basket WHERE conid = ?1 AND valid_to IS NOT NULL")
-                    .map_err(|e| format!("credit_basket: {e}"))?;
-                let rows = stmt
-                    .query_map(params![h.conid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                    .map_err(|e| format!("credit_basket: {e}"))?;
-                rows.flatten().filter_map(|(f, t)| Some((parse_date(&f)?, parse_date(&t)?))).collect()
-            };
-            let stored_source: Option<String> = tx
-                .query_row("SELECT source FROM bond_prices WHERE conid = ?1 LIMIT 1", params![h.conid], |r| r.get(0))
-                .optional()
-                .map_err(|e| format!("bond_prices: {e}"))?;
-            let same_source = stored_source.as_deref() == Some(h.source.as_str());
-            // Ein Monatsnachtrag ergänzt nur eine Reihe derselben Quelle
-            if !h.full && !same_source {
-                continue;
-            }
-            // Eine volle Historie aus anderer Quelle ersetzt die Reihe; aus derselben Quelle
-            // ergänzt sie, damit ältere Kurse jenseits des Jahresfensters erhalten bleiben.
-            if h.full && !same_source {
-                tx.execute("DELETE FROM bond_prices WHERE conid = ?1", params![h.conid])
-                    .map_err(|e| format!("bond_prices: {e}"))?;
-            }
-            for (d, p) in &h.prices {
-                let sql = if same_source && closed.iter().any(|(f, t)| d >= f && d <= t) {
-                    "INSERT INTO bond_prices (conid, date_iso, price, source) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(conid, date_iso) DO NOTHING"
-                } else {
-                    "INSERT INTO bond_prices (conid, date_iso, price, source) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(conid, date_iso) DO UPDATE SET price = excluded.price, source = excluded.source"
-                };
-                tx.execute(sql, params![h.conid, iso(*d), p, h.source])
-                    .map_err(|e| format!("bond_prices: {e}"))?;
-                rows += 1;
-            }
+            rows += write_history_tx(&tx, h)?;
         }
         tx.execute("DELETE FROM bond_prices WHERE conid NOT IN (SELECT conid FROM credit_basket)", [])
             .map_err(|e| format!("bond_prices: {e}"))?;
+        prune_history_done_tx(&tx)?;
+        tx.commit().map_err(|e| format!("IB-Daten: {e}"))?;
+        Ok(rows)
+    }
+
+    /// Stufe 2 des IB-Abrufs: schreibt nachgeladene Kurse, ohne den Korb anzufassen, und nur
+    /// für Anleihen, die gerade offen im Korb stehen. Wurde ein Emittent inzwischen entfernt
+    /// (auch wenn er danach neu angelegt wurde), verwirft das Speichern seine Kurse.
+    pub fn save_bond_histories(&self, histories: &[BondPriceHistory]) -> Result<usize, String> {
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("IB-Daten: {e}"))?;
+        let mut rows = 0;
+        for h in histories {
+            let open: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM credit_basket WHERE conid = ?1 AND valid_to IS NULL)",
+                    params![h.conid],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("credit_basket: {e}"))?;
+            if open {
+                rows += write_history_tx(&tx, h)?;
+            }
+        }
         tx.commit().map_err(|e| format!("IB-Daten: {e}"))?;
         Ok(rows)
     }
@@ -454,21 +514,39 @@ impl ComputeStore {
             .unwrap_or_default()
     }
 
-    /// Merkt sich Anleihen mit vollständig geliefertem Verlauf; Anleihen außerhalb des Korbs fallen heraus.
+    /// Merkt sich Anleihen mit vollständig geliefertem Verlauf, nur solange sie offen im Korb
+    /// stehen; alles in einer Transaktion mit der Bereinigung.
     pub fn add_history_done(&self, conids: &[i32]) -> Result<(), String> {
-        let mut done = self.load_history_done();
-        done.extend(conids.iter().copied());
-        let conn = self.connect()?;
-        let in_basket: std::collections::BTreeSet<i32> = {
-            let mut stmt = conn
-                .prepare("SELECT DISTINCT conid FROM credit_basket")
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("meta_kv: {e}"))?;
+        let mut done: std::collections::BTreeSet<i32> = tx
+            .query_row("SELECT value FROM meta_kv WHERE key = ?1", params![HISTORY_DONE_KEY], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(|e| format!("meta_kv: {e}"))?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        for c in conids {
+            let open: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM credit_basket WHERE conid = ?1 AND valid_to IS NULL)",
+                    params![c],
+                    |r| r.get(0),
+                )
                 .map_err(|e| format!("credit_basket: {e}"))?;
-            let rows = stmt.query_map([], |r| r.get::<_, i32>(0)).map_err(|e| format!("credit_basket: {e}"))?;
-            rows.flatten().collect()
-        };
-        done.retain(|c| in_basket.contains(c));
+            if open {
+                done.insert(*c);
+            }
+        }
         let json = serde_json::to_string(&done).map_err(|e| e.to_string())?;
-        self.set_meta(HISTORY_DONE_KEY, &json)
+        tx.execute(
+            "INSERT INTO meta_kv (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![HISTORY_DONE_KEY, json],
+        )
+        .map_err(|e| format!("meta_kv: {e}"))?;
+        prune_history_done_tx(&tx)?;
+        tx.commit().map_err(|e| format!("meta_kv: {e}"))
     }
 
     /// Tageskurse und Kursquelle je Anleihe.
@@ -648,7 +726,6 @@ pub struct IssuerBondInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credit_fetch::BondPriceHistory;
 
     fn temp_store(name: &str) -> ComputeStore {
         let dir = std::env::temp_dir().join(format!("konvex-compute-test-{name}-{}", std::process::id()));
@@ -871,15 +948,13 @@ mod tests {
         assert_eq!(store.load_stored_bonds().unwrap()[&7].bars, 30);
 
         // Stufe 2: Jahresverlauf derselben Quelle ergänzt; der Monat bleibt mit seinen Kursen
-        let mut year = IbFetchOutcome::default();
-        year.selections.insert("XYZ".into(), vec![bond.clone()]);
-        year.histories.push(BondPriceHistory {
+        let year = BondPriceHistory {
             conid: 7,
             source: "bid".into(),
             prices: days(d(2026, 6, 1), 100, 88.0),
             full: true,
-        });
-        store.save_ib_outcome(&year, d(2026, 11, 27)).unwrap();
+        };
+        store.save_bond_histories(std::slice::from_ref(&year)).unwrap();
         let stored = store.load_stored_bonds().unwrap();
         assert_eq!(stored[&7].bars, 130);
         assert_eq!(stored[&7].last_date, d(2026, 11, 26));
@@ -894,5 +969,53 @@ mod tests {
         // Vollständig geliefert: gemerkt, aber nur solange die Anleihe zum Korb gehört
         store.add_history_done(&[7, 99]).unwrap();
         assert_eq!(store.load_history_done(), std::collections::BTreeSet::from([7]));
+
+        // Emittent entfernt und neu angelegt, während Stufe 2 lief: Marke und Kurse sind weg,
+        // und das späte Ergebnis von Stufe 2 legt weder Korb noch Kurse wieder an
+        let empty = CreditSettings { issuers: Vec::new(), ..Default::default() };
+        store.save_credit_settings(&empty, d(2026, 11, 27)).unwrap();
+        assert!(store.load_history_done().is_empty());
+        xyz_settings(&store, "BBB", d(2026, 11, 27));
+        assert_eq!(store.save_bond_histories(&[year]).unwrap(), 0);
+        let conn = store.connect().unwrap();
+        assert!(ComputeStore::load_basket_in(&conn).unwrap().is_empty());
+        assert!(store.load_stored_bonds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stage_two_leaves_closed_basket_periods_untouched() {
+        let store = temp_store("stage2-closed");
+        xyz_settings(&store, "BBB", d(2026, 11, 1));
+        let bond = |conid| SelectedBond {
+            conid,
+            description: format!("XYZ {conid}"),
+            coupon_pct: 5.0,
+            maturity: d(2031, 1, 15),
+        };
+        let hist = |prices: Vec<(NaiveDate, f64)>| BondPriceHistory { conid: 7, source: "bid".into(), prices, full: true };
+        // Erster Korb mit Anleihe 7 und einer Lücke am 11. November
+        let mut first = IbFetchOutcome::default();
+        first.selections.insert("XYZ".into(), vec![bond(7)]);
+        first.histories.push(hist(vec![(d(2026, 11, 10), 90.0), (d(2026, 11, 12), 91.0)]));
+        store.save_ib_outcome(&first, d(2026, 11, 12)).unwrap();
+        // Anleihe 7 scheidet am 20. aus (Zeitraum bis 19.) und kommt am 25. zurück
+        let mut swap = IbFetchOutcome::default();
+        swap.selections.insert("XYZ".into(), vec![bond(8)]);
+        store.save_ib_outcome(&swap, d(2026, 11, 20)).unwrap();
+        let mut back = IbFetchOutcome::default();
+        back.selections.insert("XYZ".into(), vec![bond(8), bond(7)]);
+        store.save_ib_outcome(&back, d(2026, 11, 25)).unwrap();
+
+        // Stufe 2 bringt Kurse für die Lücke, einen geänderten Kurs im alten Zeitraum und neue Tage
+        let year = hist(vec![
+            (d(2026, 11, 11), 50.0),
+            (d(2026, 11, 12), 60.0),
+            (d(2026, 11, 25), 92.0),
+        ]);
+        store.save_bond_histories(&[year]).unwrap();
+        let prices = &store.load_bond_prices(&[7]).unwrap()[&7].0;
+        assert!(!prices.contains_key(&d(2026, 11, 11)), "Lücke im abgeschlossenen Zeitraum bleibt");
+        assert_eq!(prices[&d(2026, 11, 12)], 91.0);
+        assert_eq!(prices[&d(2026, 11, 25)], 92.0);
     }
 }

@@ -18,7 +18,7 @@ use crate::models::{
 use crate::credit::SelectedBond;
 use crate::credit_fetch::{
     build_fred_client, connect_ib_session, fetch_fred_series, fetch_ib_bonds, fetch_ib_histories,
-    fetch_treasury_curve, fred_series_ids, history_targets, CreditSettings, IbFetchOutcome, IbSession,
+    fetch_treasury_curve, fred_series_ids, history_targets, CreditSettings, IbSession,
     FRED_HISTORY_DAYS, FRED_OVERLAP_DAYS, TREASURY_ANCHOR_SERIES,
 };
 use crate::credit_store::IssuerBondInfo;
@@ -104,13 +104,12 @@ pub struct CreditStatus {
     pub errors: Vec<String>,
 }
 
-/// Was Stufe 2 des IB-Abrufs aus Stufe 1 übernimmt: Verbindung, Korb, Kontrakte und Status.
+/// Was Stufe 2 des IB-Abrufs aus Stufe 1 übernimmt: Verbindung, Ziele, Kontrakte und Status.
 struct HistoryJob {
     session: IbSession,
     targets: Vec<SelectedBond>,
-    outcome: IbFetchOutcome,
+    contracts: std::collections::BTreeMap<i32, ibapi::contracts::Contract>,
     status: String,
-    today: chrono::NaiveDate,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -380,7 +379,7 @@ impl AppState {
                         let stored = self.store.load_stored_bonds().unwrap_or_default();
                         let targets = history_targets(&outcome.selections, &stored, &self.store.load_history_done());
                         if !targets.is_empty() {
-                            stage_two = Some(HistoryJob { session, targets, outcome, status, today });
+                            stage_two = Some(HistoryJob { session, targets, contracts: outcome.contracts, status });
                         }
                     }
                 }
@@ -427,9 +426,8 @@ impl AppState {
         Ok(result)
     }
 
-    /// Stufe 2 des IB-Abrufs: lädt den längeren Kursverlauf der Korbanleihen nach. Der Korb
-    /// bleibt unverändert; Emittenten, die inzwischen aus den Einstellungen entfernt wurden,
-    /// schreibt das Speichern nicht zurück.
+    /// Stufe 2 des IB-Abrufs: lädt den längeren Kursverlauf der Korbanleihen nach. Sie schreibt
+    /// nur Kurse und nur für Anleihen, die beim Speichern offen im Korb stehen.
     async fn load_bond_histories(self: Arc<Self>, guard: OwnedMutexGuard<()>, job: HistoryJob) {
         // Setzt die Anzeige „Verlauf lädt“ auch dann zurück, wenn diese Stufe unerwartet abbricht
         struct ResetFlag<'a>(&'a AtomicBool);
@@ -439,16 +437,10 @@ impl AppState {
             }
         }
         let _reset = ResetFlag(&self.history_loading);
-        let HistoryJob { mut session, targets, outcome, status, today } = job;
-        let fetched = fetch_ib_histories(&mut session, &targets, &outcome.contracts).await;
+        let HistoryJob { mut session, targets, contracts, status } = job;
+        let fetched = fetch_ib_histories(&mut session, &targets, &contracts).await;
         drop(session);
         let loaded = fetched.histories.len();
-        let save = IbFetchOutcome {
-            port: outcome.port,
-            selections: outcome.selections,
-            histories: fetched.histories,
-            ..Default::default()
-        };
         let mut errors: Vec<String> = self
             .store
             .get_meta("credit_last_errors")
@@ -456,7 +448,8 @@ impl AppState {
             .flatten()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        match self.store.save_ib_outcome(&save, today) {
+        // Nur Kurse, kein Korb: Was inzwischen nicht mehr offen im Korb steht, verwirft das Speichern
+        match self.store.save_bond_histories(&fetched.histories) {
             Ok(_) => {
                 if let Err(e) = self.store.add_history_done(&fetched.done) {
                     errors.push(e);
@@ -491,13 +484,17 @@ impl AppState {
     }
 
     fn finance_view(&self, gpu: &str) -> Result<FinanceView, String> {
+        // Status vor den Daten lesen: Meldet er eine Stufe als beendet, sind ihre Daten schon
+        // gespeichert und stecken im Bericht. Umgekehrt könnte ein beendeter Status mit einem
+        // Bericht vom Stand davor ankommen, und die Oberfläche würde nicht mehr neu rechnen.
+        let status = self.credit_status();
         let settings = self.store.load_credit_settings();
         let today = chrono::Utc::now().date_naive();
         let (inputs, bonds) = self.store.build_model_inputs(gpu, &settings)?;
         Ok(FinanceView {
             report: compute_regime(&inputs, today),
             bonds,
-            status: self.credit_status(),
+            status,
             settings,
         })
     }
