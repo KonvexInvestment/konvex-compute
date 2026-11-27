@@ -573,6 +573,16 @@ h2[data-term],
   gap: 12px;
 }
 
+/* Quellenangabe (Ornn verlangt Nennung mit data.ornn.com) */
+.source-note {
+  margin-top: 4px;
+  color: var(--text-dimmed);
+  font-size: 11px;
+  text-align: center;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 .ka-card {
   background: var(--bg-card);
   border: 1px solid var(--border-primary);
