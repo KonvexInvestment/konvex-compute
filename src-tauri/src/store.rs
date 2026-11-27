@@ -63,6 +63,42 @@ CREATE TABLE IF NOT EXISTS meta_kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS credit_series (
+    series_id TEXT NOT NULL,
+    date_iso TEXT NOT NULL,
+    value REAL NOT NULL,
+    PRIMARY KEY (series_id, date_iso)
+);
+
+-- Anleihekorb je Emittent mit Gültigkeit: von valid_from bis einschließlich valid_to
+-- (NULL: gehört weiter dazu). Ausgeschiedene Anleihen bleiben mit ihren Kursen für den Verlauf.
+CREATE TABLE IF NOT EXISTS credit_basket (
+    issuer TEXT NOT NULL,
+    conid INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    coupon REAL NOT NULL,
+    maturity TEXT NOT NULL,
+    valid_from TEXT NOT NULL,
+    valid_to TEXT,
+    PRIMARY KEY (issuer, conid, valid_from)
+);
+
+-- Agenturrating je Emittent ab Gültigkeitsbeginn
+CREATE TABLE IF NOT EXISTS credit_ratings (
+    issuer TEXT NOT NULL,
+    valid_from TEXT NOT NULL,
+    rating TEXT NOT NULL,
+    PRIMARY KEY (issuer, valid_from)
+);
+
+CREATE TABLE IF NOT EXISTS bond_prices (
+    conid INTEGER NOT NULL,
+    date_iso TEXT NOT NULL,
+    price REAL NOT NULL,
+    source TEXT NOT NULL,
+    PRIMARY KEY (conid, date_iso)
+);
 "#;
 
 /// Live-Snapshots bleiben so lange vollständig erhalten (alle 15 Min.), danach nur der letzte je Tag.
@@ -94,7 +130,7 @@ impl ComputeStore {
         Ok(store)
     }
 
-    fn connect(&self) -> Result<Connection, String> {
+    pub(crate) fn connect(&self) -> Result<Connection, String> {
         let conn = Connection::open(&self.db_path)
             .map_err(|e| format!("SQLite-Verbindung fehlgeschlagen: {e}"))?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
@@ -107,6 +143,7 @@ impl ComputeStore {
         let conn = self.connect()?;
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|e| format!("SQLite-Schema-Fehler: {e}"))?;
+        crate::credit_store::migrate_credit_tables(&conn)?;
         Ok(())
     }
 

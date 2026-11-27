@@ -23,6 +23,7 @@
         <button type="button" role="tab" id="vtab-curve" data-view="curve" aria-selected="true" focusgroupstart class="ka-nav-tab">Forward-Kurve</button>
         <button type="button" role="tab" id="vtab-compare" data-view="compare" aria-selected="false" class="ka-nav-tab">Tages- &amp; Wochenvergleich</button>
         <button type="button" role="tab" id="vtab-matrix" data-view="matrix" aria-selected="false" class="ka-nav-tab">Alle GPUs</button>
+        <button type="button" role="tab" id="vtab-finance" data-view="finance" aria-selected="false" class="ka-nav-tab">Finanzierung</button>
         <button type="button" role="tab" id="vtab-store" data-view="store" aria-selected="false" class="ka-nav-tab">Data Store</button>
       </nav>
 
@@ -311,7 +312,119 @@
         </div>
       </div>
 
-      <!-- ANSICHT 4: Lokaler SQLite Data Store -->
+      <!-- ANSICHT 4: Finanzierungsregime (Kreditaufschläge und GPU-Kurve) -->
+      <div role="tabpanel" id="panel-finance" aria-labelledby="vtab-finance" class="view-panel" hidden>
+        <div class="panel-inner">
+          <section class="ka-card panel-pad fin-regime" id="fin-regime" aria-live="polite"></section>
+
+          <section class="fin-kpi-grid" id="fin-kpi-grid"></section>
+
+          <section class="ka-card panel-pad">
+            <div class="section-head">
+              <div>
+                <h2 class="section-title" data-term="fsi">Stressindex und Regime</h2>
+                <p class="section-sub">Tageswerte der letzten 400 Tage. Hinterlegt ist das bestätigte Regime, gestrichelt die Eintritts- und Austrittsschwelle.</p>
+              </div>
+              <div class="chart-legend" id="fin-legend" aria-label="Legende"></div>
+            </div>
+            <div class="fin-stage" id="fin-chart-stage">
+              <svg id="fin-chart-svg" class="chart-svg" role="img" aria-label="Verlauf des Stressindex mit Regimephasen"></svg>
+              <div class="ka-tooltip" id="fin-tooltip" hidden></div>
+            </div>
+          </section>
+
+          <section class="fin-detail-grid">
+            <article class="ka-card panel-pad">
+              <div class="section-head">
+                <div>
+                  <h2 class="section-title" id="fin-issuer-caption">Emittenten am Anleihemarkt</h2>
+                  <p class="section-sub">Spread zur Staatsanleihe gleicher Laufzeit, eingeordnet ins Raster der ICE-BofA-Aufschläge je Ratingstufe.</p>
+                </div>
+              </div>
+              <div tabindex="0" role="region" aria-labelledby="fin-issuer-caption" class="table-wrapper">
+                <table class="ka-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Emittent</th>
+                      <th scope="col" class="num"><span data-term="gSpread">Spread</span></th>
+                      <th scope="col" class="num">Δ 30T</th>
+                      <th scope="col">Agentur</th>
+                      <th scope="col"><span data-term="impliedRating">Marktniveau</span></th>
+                      <th scope="col" class="num"><span data-term="ratingGap">Abstand</span></th>
+                      <th scope="col">Stand</th>
+                    </tr>
+                  </thead>
+                  <tbody id="fin-issuer-tbody"></tbody>
+                </table>
+              </div>
+              <p class="section-sub fin-bonds" id="fin-bonds"></p>
+            </article>
+
+            <article class="ka-card panel-pad">
+              <div class="section-head">
+                <div>
+                  <h2 class="section-title" id="fin-macro-caption" data-term="macroBlock">Makroblock</h2>
+                  <p class="section-sub">ICE-BofA-Aufschläge des US-Unternehmensanleihemarkts und ihr robuster z-Wert über drei Jahre.</p>
+                </div>
+              </div>
+              <div tabindex="0" role="region" aria-labelledby="fin-macro-caption" class="table-wrapper">
+                <table class="ka-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Reihe</th>
+                      <th scope="col" class="num"><span data-term="oas">OAS</span></th>
+                      <th scope="col" class="num"><span data-term="zScore">z-Wert</span></th>
+                      <th scope="col">Stand</th>
+                    </tr>
+                  </thead>
+                  <tbody id="fin-macro-tbody"></tbody>
+                </table>
+              </div>
+              <div class="mini-grid fin-price-grid" id="fin-price-grid"></div>
+            </article>
+          </section>
+
+          <section class="ka-card panel-pad">
+            <div class="section-head">
+              <div>
+                <h2 class="section-title">Datenstand und Einstellungen</h2>
+                <p class="section-sub mono" id="fin-status"></p>
+              </div>
+              <div class="toolbar-cluster">
+                <button type="button" class="ka-btn ka-btn-primary" id="fin-refresh-btn">
+                  <span class="ka-spinner" aria-hidden="true"></span>
+                  <span class="ka-btn-label">Kreditdaten aktualisieren</span>
+                </button>
+              </div>
+            </div>
+            <ul class="fin-errors" id="fin-errors" hidden></ul>
+            <form class="fin-settings" id="fin-settings" autocomplete="off">
+              <fieldset class="fin-fieldset">
+                <legend>Interactive Brokers (lokale TWS oder IB Gateway, nur lesend)</legend>
+                <label class="ka-check"><input type="checkbox" id="fin-ib-enabled"> Anleihekurse über IB laden</label>
+                <label class="fin-field">Host <input class="ka-input mono" id="fin-ib-host" maxlength="253" spellcheck="false"></label>
+                <label class="fin-field">Port <input class="ka-input mono" id="fin-ib-port" type="number" min="0" max="65535" step="1"></label>
+                <label class="fin-field">Client-ID <input class="ka-input mono" id="fin-ib-client" type="number" min="0" max="999999" step="1"></label>
+                <p class="section-sub">Port 0 probiert 7496, 7497, 4001 und 4002. Client-ID 0 wählt eine freie ID aus 8300 bis 8399.</p>
+              </fieldset>
+              <fieldset class="fin-fieldset">
+                <legend>Emittenten</legend>
+                <div class="fin-issuer-rows" id="fin-issuer-rows"></div>
+                <p class="section-sub">Agenturrating als Vergleichswert, zum Beispiel BBB- oder Baa2. Die Voreinstellungen sind eigene Annahmen zum Stand November 2026.</p>
+              </fieldset>
+              <div class="toolbar-cluster">
+                <button type="submit" class="ka-btn ka-btn-ghost" id="fin-save-btn" disabled>Einstellungen speichern</button>
+              </div>
+            </form>
+          </section>
+
+          <p class="source-note fin-source-note">
+            Quellen: ICE BofA US Corporate und High Yield OAS über FRED (Federal Reserve Bank of St. Louis, nur zur internen Nutzung, nicht weitergeben) · Treasury.gov, Daily Treasury Par Yield Curve · Anleihekurse aus der eigenen IB-Verbindung · Polymarket-Forward-Kurve · Ornn-Spot nur als Basis zur Kurve. Modell und Schwellen sind eigene Annahmen. Keine Anlageberatung.
+          </p>
+        </div>
+      </div>
+
+      <!-- ANSICHT 5: Lokaler SQLite Data Store -->
       <div role="tabpanel" id="panel-store" aria-labelledby="vtab-store" class="view-panel" hidden>
         <div class="panel-inner">
           <section class="store-kpi-grid" id="store-kpi-grid"></section>

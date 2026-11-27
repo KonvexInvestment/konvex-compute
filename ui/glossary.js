@@ -34,6 +34,19 @@ export const GLOSSARY = {
   backfill: "Backfill: rekonstruiert vergangene Tageskurven aus dem Polymarket-Kursverlauf, damit Tages- und Wochenvergleiche ohne wochenlanges Sammeln funktionieren.",
   snapshot: "Snapshot: gespeicherter Stand der kompletten Forward-Kurve. Live-Snapshots entstehen alle 15 Minuten, nach 48 Stunden bleibt je Tag der letzte.",
   spotDays: "Anzahl gespeicherter Ornn-Tagesschlusskurse.",
+  regime: "Finanzierungsregime: verbindet Kreditaufschläge mit der GPU-Forward-Kurve. Ein neues Regime gilt erst nach drei Tagen in Folge, eine Übertragung ohne Bruchsignal erst nach sieben.",
+  fsi: "Stressindex: Mittel aus Makroblock (robuste z-Werte der Hochzins-, CCC- und BBB-Aufschläge über drei Jahre) und KI-Block (Abstand zwischen Marktniveau und Agenturrating der Emittenten). Stress beginnt ab 1,0 und endet erst unter 0,5.",
+  macroBlock: "Makroblock: Wie weit die Kreditaufschläge des gesamten US-Unternehmensanleihemarkts über ihrem üblichen Niveau der letzten drei Jahre liegen, in robusten Standardabweichungen.",
+  aiBlock: "KI-Block: durchschnittlicher Abstand zwischen der Ratingstufe, die der Anleihemarkt den Emittenten einpreist, und ihrem Agenturrating. 1 Stufe entspricht etwa drei Notches.",
+  gSpread: "Spread: Rendite der Anleihen aus dem Geldkurs minus Rendite der US-Staatsanleihe gleicher Restlaufzeit, in Basispunkten, gemittelt über die Anleihen im Korb. Die Veränderung über 30 Tage zählt nur Bewegungen einzelner Anleihen, damit ein Wechsel im Korb keinen Sprung erzeugt.",
+  impliedRating: "Marktniveau: die Ratingstufe, deren durchschnittlicher Kreditaufschlag (ICE BofA OAS) dem Spread des Emittenten entspricht.",
+  ratingGap: "Abstand: Marktniveau minus Agenturrating in Stufen. Positiv heißt: Der Anleihemarkt bewertet den Emittenten schlechter als die Ratingagentur.",
+  oas: "OAS: optionsbereinigter Kreditaufschlag eines ICE-BofA-Anleiheindex über US-Staatsanleihen, in Prozentpunkten.",
+  zScore: "z-Wert: Abstand zum Median der letzten drei Jahre in robusten Standardabweichungen (Median der absoluten Abweichungen), auf ±4 begrenzt.",
+  coupling: "Kopplung: Regression der 7-Tage-Veränderung des nahen Kurvenmedians auf die 7-Tage-Veränderung des Stressindex eine Woche zuvor, über 90 Tage. Negativ heißt: Steigender Stress ging fallenden Mietpreisen voraus.",
+  breakProb: "Bruchwahrscheinlichkeit: Wahrscheinlichkeit nach Adams und MacKay (2007), dass die täglichen Veränderungen in den letzten sieben Tagen ein neues Muster begonnen haben. Erst ab 30 Beobachtungen aussagekräftig.",
+  nearCurve: "Nahe Kurve: Median und unteres Quartil bei fester Laufzeit von 90 Tagen, linear zwischen den Liefermonaten. So entsteht kein Sprung, wenn ein Liefermonat ausläuft.",
+  basis: "Basis: Spot relativ zum nahen Kurvenmedian, in Prozent. Sinkt die Basis, fällt der Spot stärker als die Kurve.",
 };
 
 let tipEl = null;
@@ -113,6 +126,9 @@ function describeSource(raw) {
   const own = raw.match(/Ornn (Spot|Historie) \(([^)]+)\)/);
   if (own) return `Ornn-${own[1]} ${own[2]}`;
   if (/ornn/i.test(raw)) return "Ornn-Index";
+  if (/^FRED\b|fred\.stlouisfed/i.test(raw)) return "FRED-Kreditaufschläge";
+  if (/Treasury\.gov|home\.treasury\.gov/i.test(raw)) return "Treasury-Zinskurve";
+  if (/^IB\b/.test(raw)) return "Interactive Brokers";
   return null;
 }
 

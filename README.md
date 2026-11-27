@@ -12,11 +12,40 @@ Beispielprojekt aus dem [KI-Lab von Konvex Investment](https://konvexinvestment.
 - **Strike-Leiter:** Ein Klick auf einen Strike lädt dessen 30-Tage-Wahrscheinlichkeitsverlauf aus der CLOB-API, in 14-Tage-Abschnitten, weil die API längere Fenster ablehnt.
 - **Erklärungen in der Oberfläche:** Gepunktet unterstrichene Fachbegriffe erklären sich beim Überfahren mit der Maus, der Hauptchart hat eine Legende, Abruffehler erscheinen als kurze Hinweise mit aufklappbaren Details.
 - **Alle GPUs im Vergleich:** Relative-Value-Matrix über die vier GPU-Generationen (Verhältnis zur H100, Kurvensteigung) und weitere Ornn-Spot-Indizes (`A100 SXM4`, `RTX 5090`, `RTX PRO 6000 WS`).
+- **Finanzierungsregime ([`regime.rs`](src-tauri/src/regime.rs)):** verbindet Kreditaufschläge des Anleihemarkts und der Emittenten Oracle, CoreWeave und SpaceX mit der GPU-Forward-Kurve und erkennt Regimewechsel. Details im Abschnitt [Finanzierungsregime](#finanzierungsregime).
 - **Data Store:** Übersicht über die lokale Datenbank, manueller Backfill und CSV-Export in den Download-Ordner.
 
 ## Warum der Roh-Mean bei fernen Verfällen über dem Median liegt
 
 Ein GPU-Mietpreis ist nach unten bei `0 $` begrenzt, nach oben offen. Ferne binäre Polymarket-Kontrakte binden zudem lange Kapital, deshalb fallen weit entfernte Strikes kaum unter einen impliziten Zinsboden (Beispielwert: 8 bis 10 Cent). Der volle Erwartungswert (`Roh-Mean`) gewichtet diesen oberen Tail mit der ganzen Dollarbreite und steigt dadurch, während Median (`P50`) und Kern-Mean die zentrale Markterwartung zeigen.
+
+## Finanzierungsregime
+
+GPU-Rechenzentren entstehen überwiegend auf Kredit. Die Modellannahme: Die Finanzierung wirkt in zwei Richtungen auf den Mietpreis. Teure Finanzierung bremst neue Kapazität und stützt damit die Mieten bestehender GPUs (Angebotskanal). Geraten Betreiber oder große Abnehmer in eine Notlage, kommen Kapazität und Flotten auf den Markt, und die Mieten fallen mit dem Stress (Notlagenkanal). Welcher Kanal überwiegt, bestimmt das Regime.
+
+**Kreditseite.** Der Stressindex mittelt zwei Blöcke:
+
+- **Makroblock:** robuste z-Werte (Abstand zum Median in Einheiten des skalierten Medians der absoluten Abweichungen, über bis zu drei Jahre, auf ±4 begrenzt) der ICE-BofA-Aufschläge für Hochzins gesamt, CCC und BBB.
+- **KI-Block:** Für jeden Emittenten rechnet die Software aus dem Geldkurs von bis zu drei Anleihen die Rendite (30/360, halbjährlicher Kupon) und zieht die Rendite der US-Staatsanleihe gleicher Restlaufzeit ab. Das Tagesniveau ist der Mittelwert der Anleihen, die an diesem Tag zum Korb gehören und bis dahin notiert haben. Scheidet eine Anleihe aus, bleiben ihre Kurse für die früheren Tage gespeichert; eine neue zählt erst ab dem Tag ihrer Aufnahme. Ein Wechsel im Korb oder im Agenturrating gilt nicht als Kreditbewegung: Die Veränderung an diesem Tag zählt weder für die Bruchpunkt-Erkennung noch für die Kopplung, und die Spalte für 30 Tage misst nur Bewegungen einzelner Anleihen. Der Spread wird logarithmisch ins Raster der ICE-BofA-Aufschläge je Ratingstufe (AAA bis CCC) eingeordnet. Der Block ist der durchschnittliche Abstand zwischen diesem Marktniveau und dem Agenturrating, in Stufen (eine Stufe entspricht etwa drei Notches). Beispielwert: Ein Emittent mit Agenturrating BBB, dessen Spread zwischen BB und B liegt, hat einen Abstand von etwa 1,5.
+
+**Anleiheabruf in zwei Stufen.** IB beantwortet Anfragen nach Anleihekursen langsam und arbeitet gleichzeitige Anfragen nacheinander ab: Ein Monat Tageskurse braucht typischerweise einige Sekunden, ein Jahr bis zu mehreren Minuten. Die erste Stufe stellt den Korb deshalb nur aus Monatsabrufen zusammen. Eine neue Anleihe kommt in den Korb, sobald ihr Monat mindestens zehn Handelstage liefert; Korb, Spreads und Einordnung stehen danach im Reiter. Die zweite Stufe lädt im Hintergrund ein Jahr Kurse für Anleihen nach, die weniger als etwa drei Monate gespeichert haben. Bis dahin fehlen die Veränderung über 30 Tage und der ältere Verlauf. Antwortet IB nicht rechtzeitig, bleibt die Anleihe im Korb, und der nächste Abruf versucht es erneut.
+
+**GPU-Seite.** Aus den gespeicherten Kurvenständen entstehen je Tag Median und unteres Quartil bei fester Laufzeit von 90 Tagen, linear zwischen den Liefermonaten. Die Märkte rechnen gegen den Monatsdurchschnitt ab, deshalb zählt die Monatsmitte als Laufzeitpunkt, und ein Liefermonat fällt heraus, sobald er begonnen hat. Der Ornn-Spot geht nur als Basis zur nahen Kurve ein.
+
+**Regime.** Stress beginnt ab einem Indexwert von 1,0 und endet erst unter 0,5. Ein gemeinsamer Rückgang heißt: Median und unteres Quartil fallen über 14 Tage um mindestens 5 % oder über 30 Tage um mindestens 8 %, und der Spot fällt mindestens so stark wie die Kurve.
+
+| Regime | Kreditseite | GPU-Seite |
+|---|---|---|
+| Ruhig | normal | kein gemeinsamer Rückgang |
+| Preisdruck ohne Kreditstress | normal | gemeinsamer Rückgang (Angebot, Generationswechsel) |
+| Kreditstress, Mieten fest | Stress | kein gemeinsamer Rückgang (Angebotskanal überwiegt) |
+| Übertragung auf die Mieten | Stress | gemeinsamer Rückgang (Notlagenkanal überwiegt) |
+
+Ein neues Regime gilt erst nach drei Tagen in Folge; nur die erste Einstufung nach dem Start gilt sofort, außer einer Übertragung. Eine Übertragung braucht sieben Tage, wenn weder die Bruchpunkt-Erkennung (Bayesian Online Changepoint Detection nach Adams und MacKay, 2007) in den täglichen Kursänderungen einen frischen Bruch meldet noch die Kopplung negativ ist. Die Kopplung ist eine Regression der 7-Tage-Änderung des nahen Medians auf die 7-Tage-Änderung des Stressindex eine Woche zuvor, über 90 Tage. Eine Vorwarnung erscheint im Regime „Kreditstress, Mieten fest“, wenn der Spot stärker fällt als die Kurve, die Kopplung negativ wird oder die Bruchpunkt-Erkennung anschlägt. Handelt ein Emittent am Anleihemarkt im CCC-Bereich, erscheint das als eigener Hinweis auf der Kreditseite.
+
+**Stichtagstreue.** Jeder Tageswert nutzt nur Daten, die an diesem Tag bekannt waren: Die ICE-BofA-Aufschläge zählen erst ab dem folgenden Geschäftstag, weil sie dann erscheinen (der Freitagswert also ab Montag), und die Bruchpunkt-Erkennung normiert jede Beobachtung nur mit der Streuung der vorherigen. Ein geändertes Agenturrating gilt ab dem Tag der Änderung, frühere Tage behalten das alte. Fehlt an einem Tag eine Einstufung, beginnt die Zählung für ein neues Regime von vorn. Liegt die letzte vollständige Einstufung mehr als drei Tage zurück, verfällt das Regime, auch im Verlauf; die nächste Einstufung gilt dann wieder als erste. Ebenso beginnen nach einer Lücke von mehr als drei Tagen die Eintrittsschwellen für Stress und Rückgang neu, statt einen Zustand von vor der Lücke fortzuschreiben. Ein Wechsel ist auf den Tag der Bestätigung datiert.
+
+**Grenzen.** Alle Schwellen sind eigene Setzungen und nicht an historischen Krisen kalibriert. Die GPU-Seite braucht mindestens 15 Tage Kurvenhistorie, die Bruchpunkt-Erkennung mindestens 30 Beobachtungen. Feiertage kennt der Veröffentlichungsverzug nicht, und spätere Korrekturen einzelner OAS-Werte überschreiben den gespeicherten Wert, statt als eigener Datenstand zu gelten. Der erste Korb eines Emittenten zählt mit seiner ganzen abgerufenen Historie; Anleihen, die schon vorher fällig wurden, fehlen darin. Lädt die zweite Stufe diesen Verlauf erst nach, ändern sich die früheren Tageswerte des ersten Korbs dabei einmal; abgeschlossene Korbzeiträume bekommen keine Kurse mehr. Der Spread zur Staatsanleihe ist eine Näherung an den optionsbereinigten Aufschlag der Indizes. Agenturratings ändern sich und werden in den Einstellungen gepflegt; die Voreinstellungen sind eigene Annahmen zum Stand November 2026. Ohne laufende TWS oder IB Gateway rechnet das Modell nur mit dem Makroblock; Veränderungen über einen solchen Wechsel hinweg zählen weder für die Bruchpunkt-Erkennung noch für die Kopplung. Beim ersten Start lädt die Software drei Jahre Kreditaufschläge, die ältesten Tage des Verlaufs stützen sich deshalb auf ein kürzeres z-Wert-Fenster (mindestens 120 Beobachtungen); mit jedem Abruf wächst die gespeicherte Historie. Wandelanleihen kommen nicht in den Korb.
 
 ## Voraussetzungen
 
@@ -44,6 +73,8 @@ winget install --id Rustlang.Rustup -e
 ```
 
 Node.js, npm, Python und API-Schlüssel sind auf beiden Systemen nicht nötig. Die Software ruft nur öffentliche Endpunkte ohne Anmeldung ab.
+
+Optional für den KI-Block des Finanzierungsregimes: eine laufende Trader Workstation (TWS) oder ein IB Gateway von Interactive Brokers auf demselben Rechner, mit aktivierter API („Enable ActiveX and Socket Clients“). Die Software stellt nur lesende Anfragen; die Einstellung „Read-Only API“ kann aktiv bleiben. Welche Anleihen Kurse liefern, hängt von den Marktdaten-Berechtigungen des eigenen Kontos ab. Port und Client-ID lassen sich im Reiter „Finanzierung“ einstellen; ohne Angabe probiert die Software die Standard-Ports 7496, 7497, 4001 und 4002 und eine Client-ID aus 8300 bis 8399.
 
 ## Bauen und installieren
 
@@ -93,10 +124,13 @@ Zum vollständigen Entfernen genügt es, die installierte Software (unter Window
 
 ## Datenquellen und Bedingungen
 
-Die Software fragt alle Quellen direkt vom eigenen Rechner ab, alle 15 Minuten, solange sie läuft. Das Repository enthält nur Code, keine Marktdaten.
+Die Software fragt alle Quellen direkt vom eigenen Rechner ab, solange sie läuft: Kurven und Spot alle 15 Minuten, Zinskurve, Kreditaufschläge und Anleihekurse höchstens alle sechs Stunden. Das Repository enthält nur Code, keine Marktdaten.
 
 - **Ornn Compute Price Index** ([data.ornn.com](https://data.ornn.com)), kostenlose API unter `api.ornnai.com`. Der OCPI ist der Abrechnungsindex aller Polymarket-GPU-Mietpreis-Märkte. Ornns [Nutzungsbedingungen](https://ornn.com/terms-of-use) erlauben die kostenlose API nur für die eigene private oder interne Nutzung und verlangen für das Speichern von Antworten und für abgeleitete Berechnungen eine schriftliche Erlaubnis. Ornn hat Konvex Investment im November 2026 schriftlich bestätigt, dass die Nutzung in dieser Software in Ordnung ist: Abruf vom eigenen Rechner, Speicherung nur lokal, Vergleich mit der Forward-Kurve, Ornn als genannte Quelle. Eine Weitergabe der Daten ist davon nicht gedeckt, Datenbank und CSV-Exporte bleiben auf dem eigenen Rechner.
 - **Polymarket** (Gamma API und CLOB API, `gamma-api.polymarket.com`, `clob.polymarket.com`): öffentliche Lese-Endpunkte ohne Konto. Es gelten die [Nutzungsbedingungen von Polymarket](https://polymarket.com/tos). Die Software liest nur Kurse und handelt nicht.
+- **U.S. Department of the Treasury** ([Daily Treasury Par Yield Curve Rates](https://home.treasury.gov/resource-center/data-chart-center/interest-rates/TextView?type=daily_treasury_yield_curve)): tägliche Renditen der US-Staatsanleihen von einem Monat bis 30 Jahre, als Werk der US-Regierung gemeinfrei. Grundlage für den Spread der Emittenten.
+- **ICE BofA US Corporate und High Yield Option-Adjusted Spreads** über [FRED](https://fred.stlouisfed.org/) der Federal Reserve Bank of St. Louis (zum Beispiel `BAMLH0A0HYM2`, `BAMLC0A4CBBB`). Die Reihen gehören ICE Data Indices, LLC; FRED stellt sie nur zur internen Nutzung bereit, eine Weitergabe ist nicht erlaubt. Die Software lädt sie deshalb nur auf den eigenen Rechner. FRED nimmt nur Abrufe an, deren Kennung eine Kontaktadresse enthält; die Software nennt dafür die Adresse dieses Repositorys.
+- **Interactive Brokers** (optional, über die lokale TWS oder das IB Gateway): Anleihelisten und Tageskurse (Geldkurs) aus dem eigenen Konto. Es gelten die Bedingungen von Interactive Brokers und der Börsen für Marktdaten; die Kurse bleiben in der lokalen Datenbank.
 
 ## Rahmen
 

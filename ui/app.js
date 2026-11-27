@@ -12,6 +12,7 @@ import {
   renderStrikeHistoryChart,
 } from "./charts.js";
 import { annotateTerms, friendlyError, installTermTooltips } from "./glossary.js";
+import { initFinance, renderFinance } from "./finance.js";
 
 function tauriInvoke(cmd, args = {}) {
   const core = window.__TAURI__ && window.__TAURI__.core;
@@ -57,7 +58,7 @@ const state = {
   bannerSig: "",
 };
 
-const VIEWS = ["curve", "compare", "matrix", "store"];
+const VIEWS = ["curve", "compare", "matrix", "finance", "store"];
 const GPU_KEYS = ["H100", "H200", "B200", "B300"];
 const HIST_WINDOWS = ["30", "90", "all"];
 const SETTINGS_KEY = "konvex-compute-ui";
@@ -112,6 +113,7 @@ const els = {
     curve: document.getElementById("panel-curve"),
     compare: document.getElementById("panel-compare"),
     matrix: document.getElementById("panel-matrix"),
+    finance: document.getElementById("panel-finance"),
     store: document.getElementById("panel-store"),
   },
   heroKicker: document.getElementById("hero-kicker"),
@@ -977,7 +979,7 @@ function renderAll() {
   renderTopbar();
   renderGpuTabs();
 
-  const showGpuBar = state.activeView === "curve" || state.activeView === "compare";
+  const showGpuBar = state.activeView === "curve" || state.activeView === "compare" || state.activeView === "finance";
   els.gpuBar.hidden = !showGpuBar;
 
   const gpu = getCurrentGpu();
@@ -987,6 +989,8 @@ function renderAll() {
     renderCompareView(gpu);
   } else if (state.activeView === "matrix") {
     renderMatrixView();
+  } else if (state.activeView === "finance" && gpu) {
+    renderFinance(state.selectedGpu);
   } else if (state.activeView === "store") {
     renderStoreView();
   }
@@ -1143,6 +1147,14 @@ function wireTabKeyboard(container, onSelect) {
 
 function setupEvents() {
   installTermTooltips();
+  initFinance({
+    invoke: tauriInvoke,
+    listen: tauriListen,
+    showToast,
+    setActionError,
+    getGpu: () => state.selectedGpu,
+    isActive: () => state.activeView === "finance",
+  });
   wireTabKeyboard(els.viewTablist, (tab, focus) => switchView(tab.dataset.view, focus));
   wireTabKeyboard(els.gpuTablist, (tab, focus) => selectGpu(tab.dataset.gpu, focus));
 
