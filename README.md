@@ -12,7 +12,7 @@ Beispielprojekt aus dem [KI-Lab von Konvex Investment](https://konvexinvestment.
 - **Strike-Leiter:** Ein Klick auf einen Strike lädt dessen 30-Tage-Wahrscheinlichkeitsverlauf aus der CLOB-API, in 14-Tage-Abschnitten, weil die API längere Fenster ablehnt.
 - **Erklärungen in der Oberfläche:** Gepunktet unterstrichene Fachbegriffe erklären sich beim Überfahren mit der Maus, der Hauptchart hat eine Legende, Abruffehler erscheinen als kurze Hinweise mit aufklappbaren Details.
 - **Alle GPUs im Vergleich:** Relative-Value-Matrix über die vier GPU-Generationen (Verhältnis zur H100, Kurvensteigung) und weitere Ornn-Spot-Indizes (`A100 SXM4`, `RTX 5090`, `RTX PRO 6000 WS`).
-- **Data Store:** Übersicht über die lokale Datenbank, manueller Backfill und CSV-Export nach `~/Downloads/`.
+- **Data Store:** Übersicht über die lokale Datenbank, manueller Backfill und CSV-Export in den Download-Ordner.
 
 ## Warum der Roh-Mean bei fernen Verfällen über dem Median liegt
 
@@ -33,7 +33,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ### Windows
 
 - Windows 10 oder 11 auf x64 (getestet mit Windows 11)
-- Build Tools für Visual Studio mit der Workload „Desktopentwicklung mit C++“ (Compiler und Linker für Rust und SQLite)
+- Build Tools für Visual Studio 2022 mit der Workload „Desktopentwicklung mit C++“ (Compiler und Linker für Rust und SQLite)
 - Rust über rustup (getestet mit Rust 1.96), Toolchain `stable-x86_64-pc-windows-msvc`
 - WebView2-Runtime, unter Windows 11 vorinstalliert
 - PowerShell-Ausführungsrichtlinie für das eigene Konto: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
